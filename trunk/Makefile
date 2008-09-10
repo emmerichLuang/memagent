@@ -1,17 +1,20 @@
 LIBS = -levent
-CFLAGS = -Wall -O2 $(INCLUDE) -g
+CFLAGS = -Wall -O2 -g
 CC = gcc
 PROGS =	magent
 
 all: $(PROGS)
 
-STPROG = magent.o
+STPROG = magent.o ketama.o
 
-magent.o: magent.c
-	$(CC) $(CFLAGS) -c -o $@ magent.c
+ketama.o: ketama.c ketama.h
+	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ ketama.c
+
+magent.o: magent.c ketama.h
+	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ magent.c
 
 magent: $(STPROG)
-	$(CC) -g -o $@ $^ $(LIBS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 clean:
 	rm -f *.o *~ $(PROGS) tags

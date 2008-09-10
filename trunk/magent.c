@@ -53,6 +53,8 @@ SUCH DAMAGE.
 #include <signal.h>
 #include <event.h>
 
+#include "ketama.h"
+
 #define VERSION "0.2"
 
 #define OUTOFCONN "SERVER_ERROR OUT OF CONNECTION"
@@ -181,7 +183,7 @@ typedef struct token_s {
 } token_t;
 
 /* static variables */
-static int port = 11211, maxconns = 4096, curconns = 0, sockfd = -1, verbose_mode = 0;
+static int port = 11211, maxconns = 4096, curconns = 0, sockfd = -1, verbose_mode = 0, use_ketama = 0;
 static struct event ev_master;
 
 static int freetotal, freecurr;
@@ -189,6 +191,7 @@ static struct conn **freeconns;
 
 static struct matrix *matrixs = NULL; /* memcached server list */
 static int matrixcnt = 0;
+static struct ketama *ketama = NULL;
 
 static void drive_client(const int, const short, void *);
 static void drive_server(const int, const short, void *);
@@ -207,6 +210,7 @@ static void show_help(void)
 		   "  -l ip, local bind ip address, default is 0.0.0.0\n"
 		   "  -n number, set max connections, default is 4096\n"
 		   "  -D don't go to background\n"
+		   "  -k use ketama key allocation algorithm\n"
 		   "  -v verbose\n"
 		   "\n";
 	fprintf(stderr, b, strlen(b));
@@ -570,7 +574,6 @@ static int writev_list(int fd, list *l)
 		switch (errno) {
 		case EAGAIN:
 		case EINTR:
-			fprintf(stderr, "writev to fd %d interrupted\n", fd); /* QHY */
 			return 0; /* try again */
 			break;
 		case EPIPE:
@@ -664,7 +667,7 @@ static void finish_transcation(conn *c)
 
 static void do_transcation(conn *c)
 {
-	int hash;
+	int idx;
 	struct matrix *m;
 	struct server *s;
 	char *key = NULL;
@@ -676,9 +679,10 @@ static void do_transcation(conn *c)
 	put_server_into_pool(c);
 	
 	if (c->flag.is_get_cmd) {
-		for(; c->keyidx < c->keycount;) {
-			key = c->keys[c->keyidx ++];
+		while(c->keyidx < c->keycount) {
+			key = c->keys[c->keyidx];
 			if (key != NULL) break;
+			else c->keyidx ++;
 		}
 
 		if (key == NULL || c->keyidx == c->keycount) {
@@ -686,13 +690,23 @@ static void do_transcation(conn *c)
 			finish_transcation(c);
 			return;
 		}
+		c->keyidx ++;
 	} else {
 		key = c->keys[0];
 	}
 
-	/* just round selection */
-	hash = hashme(key);
-	m = matrixs + (hash%matrixcnt);
+	if (use_ketama && ketama) {
+		idx = get_server(ketama, key);
+		if (idx < 0) {
+			/* fall back to round selection */
+			idx = hashme(key)%matrixcnt;
+		}
+	} else {
+		/* just round selection */
+		idx = hashme(key)%matrixcnt;
+	}
+
+	m = matrixs + idx;
 
 	if (m->pool && (m->used > 0)) {
 		c->srv = m->pool[--m->used];
@@ -1183,13 +1197,7 @@ static void process_command(conn *c)
 		 * <data block>\r\n
 		 * "END\r\n"
 		 */
-		if (ntokens < MAX_TOKENS) {
-			c->keycount = ntokens - KEY_TOKEN - 1;
-		} else {
-			/* we need to check last token */
-			c->keycount = MAX_TOKENS - KEY_TOKEN - 2;
-		}
-
+		c->keycount = ntokens - KEY_TOKEN - 1;
 		c->keys = (char **) calloc(sizeof(char *), c->keycount);
 		if (c->keys == NULL) {
 			c->keycount = 0;
@@ -1216,13 +1224,15 @@ static void process_command(conn *c)
 							break;
 						}
 						c->keys = nn;
-						c->keys[c->keycount++] = strdup(pp);
+						c->keys[c->keycount] = strdup(pp);
+						c->keycount ++;
 						pp = strtok(NULL, " ");
 					}
 				}
 			}
 
 			c->flag.is_get_cmd = 1;
+			c->keyidx = 0;
 
 			if (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)
 				c->flag.is_gets_cmd = 1; /* GETS */
@@ -1507,6 +1517,7 @@ static void server_exit(int sig)
 	if (sockfd > 0) close(sockfd);
 
 	free(freeconns);
+	free_ketama(ketama);
 	exit(0);
 }
 
@@ -1518,7 +1529,7 @@ int main(int argc, char **argv)
 	struct linger ling = {0, 0};
 	struct matrix *m; 
 	
-	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:"))) {
+	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:k"))) {
 		switch (c) {
 		case 'u':
 			uid = atoi(optarg);
@@ -1537,6 +1548,9 @@ int main(int argc, char **argv)
 		case 'v':
 			verbose_mode = 1;
 			todaemon = 0;
+			break;
+		case 'k':
+			use_ketama = 1;
 			break;
 		case 'D':
 			todaemon = 0;
@@ -1608,6 +1622,43 @@ int main(int argc, char **argv)
 	if (freeconns == NULL) {
 		fprintf(stderr, "OUT OF MEMORY FOR FREE CONNECTION STRUCTURE\n");
 		exit(1);
+	}
+
+	if (use_ketama) {
+		ketama = (struct ketama *)calloc(sizeof(struct ketama), 1);
+		if (ketama == NULL) {
+			fprintf(stderr, "not enough memory to create ketama\n");
+			exit(1);
+		} else {
+			int i;
+			char temp[65];
+
+			ketama->count = matrixcnt;
+			ketama->weight = (int *)calloc(sizeof(int), ketama->count);
+			ketama->name = (char **)calloc(sizeof(char *), ketama->count);
+			
+			if (ketama->weight == NULL || ketama->name == NULL) {
+				fprintf(stderr, "not enough memory to create ketama\n");
+				exit(1);
+			}
+
+			for (i = 0; i < ketama->count; i ++) {
+				ketama->weight[i] = 100;
+				ketama->totalweight += ketama->weight[i];
+				snprintf(temp, 64, "%s-%d", matrixs[i].ip, matrixs[i].port);
+				ketama->name[i] = strdup(temp);
+				if (ketama->name[i] == NULL) {
+					fprintf(stderr, "not enough memory to create ketama\n");
+					exit(1);
+				}
+			}
+		}
+		if (create_ketama(ketama, 500)) {
+			fprintf(stderr, "can't create ketama\n");
+			exit(1);
+		}
+
+		fprintf(stderr, "using ketama algorithm\n");
 	}
 
 	sockfd = socket(AF_INET, SOCK_STREAM, 0);
