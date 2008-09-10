@@ -667,7 +667,7 @@ static void do_transcation(conn *c)
 	int hash;
 	struct matrix *m;
 	struct server *s;
-	char *key;
+	char *key = NULL;
 	buffer *b;
 
 	if (c == NULL) return;
@@ -676,9 +676,12 @@ static void do_transcation(conn *c)
 	put_server_into_pool(c);
 	
 	if (c->flag.is_get_cmd) {
-		if (c->keyidx < c->keycount) {
-			key = c->keys[c->keyidx++];
-		} else {
+		for(; c->keyidx < c->keycount;) {
+			key = c->keys[c->keyidx ++];
+			if (key != NULL) break;
+		}
+
+		if (key == NULL || c->keyidx == c->keycount) {
 			/* end of get transcation */
 			finish_transcation(c);
 			return;
@@ -1180,16 +1183,50 @@ static void process_command(conn *c)
 		 * <data block>\r\n
 		 * "END\r\n"
 		 */
-		c->flag.is_get_cmd = 1;
+		if (ntokens < MAX_TOKENS) {
+			c->keycount = ntokens - KEY_TOKEN - 1;
+		} else {
+			/* we need to check last token */
+			c->keycount = MAX_TOKENS - KEY_TOKEN - 2;
+		}
 
-		if (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)
-			c->flag.is_gets_cmd = 1; /* GETS */
-
-		c->keycount = ntokens - KEY_TOKEN - 1;
 		c->keys = (char **) calloc(sizeof(char *), c->keycount);
-		assert(c->keys);
-		for (i = KEY_TOKEN, j = 0; (i < ntokens) && (j < c->keycount); i ++, j ++)
-			c->keys[j] = strdup(tokens[i].value);
+		if (c->keys == NULL) {
+			c->keycount = 0;
+			out_string(c, "SERVER_ERROR OUT OF MEMORY");
+			skip = 1;
+		} else {
+			if (ntokens < MAX_TOKENS) {
+				for (i = KEY_TOKEN, j = 0; (i < ntokens) && (j < c->keycount); i ++, j ++)
+					c->keys[j] = strdup(tokens[i].value);
+			} else {
+				char *pp, **nn;
+
+				for (i = KEY_TOKEN, j = 0; (i < (MAX_TOKENS-1)) && (j < c->keycount); i ++, j ++)
+					c->keys[j] = strdup(tokens[i].value);
+
+				if (tokens[MAX_TOKENS-1].value != NULL) {
+					/* check for last TOKEN */
+					pp = strtok(tokens[MAX_TOKENS-1].value, " ");
+
+					while(pp != NULL) {
+						nn = (char **)realloc(c->keys, (c->keycount + 1)* sizeof(char *));
+						if (nn == NULL) {
+							/* out of memory */
+							break;
+						}
+						c->keys = nn;
+						c->keys[c->keycount++] = strdup(pp);
+						pp = strtok(NULL, " ");
+					}
+				}
+			}
+
+			c->flag.is_get_cmd = 1;
+
+			if (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)
+				c->flag.is_gets_cmd = 1; /* GETS */
+		}
 	} else if ((ntokens == 4 || ntokens == 5) && (
 				(strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0) ||
 				(strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)
