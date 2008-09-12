@@ -21,6 +21,7 @@ magent is a proxy server sitting between memcache clients(such as php programs) 
  # If *get gets* command had multi keys, magent will walk every key one by one as above.
  # *delete incr decr add set replace prepend append cas* command goes to both normal servers farm and backup servers fram at the same time
  # When client disconnected from magent, magent will keep connections to servers farm instead of close them.
+ # One great advantage of _n_-servers ketama is that only *1/n* portion keys reallocate when one server was added/removed from ketama.
 
 = Suggestions =
  # run magent on the same server which client runs. client connects to 127.0.0.1, which is faster
