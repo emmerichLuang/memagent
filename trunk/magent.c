@@ -1,4 +1,5 @@
 /* 
+
 Copyright (c) 2008 QUE Hongyu
 All rights reserved.
 
@@ -28,6 +29,10 @@ SUCH DAMAGE.
  * 2008-08-20, coding started
  * 2008-09-04, v0.1 finished
  * 2008-09-07, v0.2 finished, code cleanup, drive_get_server function
+ * 2008-09-09, support get/gets' multi keys(can > 7 keys)
+ * 2008-09-10, ketama allocation
+ * 2008-09-12, backup server added
+ * 2008-09-12, try backup server for get/gets command
  */
 
 #define _GNU_SOURCE
@@ -152,6 +157,8 @@ struct conn {
 		int is_set_cmd:1;
 		int no_reply:1;
 		int is_finished:1;
+		int is_update_cmd:1;
+		int is_backup:1;
 	} flag;
 
 	int keycount; /* GET/GETS multi keys */
@@ -193,11 +200,17 @@ static struct matrix *matrixs = NULL; /* memcached server list */
 static int matrixcnt = 0;
 static struct ketama *ketama = NULL;
 
+static struct matrix *backups= NULL; /* backup memcached server list */
+static int backupcnt = 0;
+static struct ketama *backupkt = NULL;
+
 static void drive_client(const int, const short, void *);
 static void drive_server(const int, const short, void *);
 static void drive_get_server(const int, const short, void *);
+static void drive_backup_server(const int, const short, void *);
 static void finish_transcation(conn *);
 static void do_transcation(conn *);
+static void out_string(conn *, const char *);
 
 static void show_help(void)
 {
@@ -206,7 +219,8 @@ static void show_help(void)
 		   "  -u uid\n" 
 		   "  -g gid\n"
 		   "  -p port, default is 11211\n"
-		   "  -s ip:port, set memcached backend server ip and port\n"
+		   "  -s ip:port, set memcached server ip and port\n"
+		   "  -b ip:port, set backup memcached server ip and port\n"
 		   "  -l ip, local bind ip address, default is 0.0.0.0\n"
 		   "  -n number, set max connections, default is 4096\n"
 		   "  -D don't go to background\n"
@@ -230,7 +244,6 @@ static int hashme(char *str)
 	hash &= 0x7FFFFFFF; /* strip the highest bit */
 	return hash;
 }
-
 
 static buffer* buffer_init_size(int size)
 {
@@ -401,7 +414,7 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
 	return ntokens;
 }
 
-static void free_server(struct server *s)
+static void server_free(struct server *s)
 {
 	if (s == NULL) return;
 
@@ -427,9 +440,9 @@ static void put_server_into_pool(conn *c)
 	if (c == NULL || c->srv == NULL) return;
 
 	s = c->srv;
+	c->srv = NULL;
 	if (s->owner == NULL || s->state != SERVER_CONNECTED || s->sfd <= 0) {
-		free_server(s);
-		c->srv = NULL;
+		server_free(s);
 		return;
 	}
 
@@ -444,6 +457,7 @@ static void put_server_into_pool(conn *c)
 			fprintf(stderr, "out of memory for pool allocation\n");
 			m = NULL;
 		} else {
+			m->size = STEP;
 			m->used = 0;
 		}
 	} else if (m->used == m->size) {
@@ -466,25 +480,46 @@ static void put_server_into_pool(conn *c)
 		event_del(&(s->ev));
 		memset(&(s->ev), 0, sizeof(struct event));
 	} else {
-		free_server(s);
+		server_free(s);
 	}
 
-	c->srv = NULL;
 }
 
 #undef STEP
 #undef MAXIDLE
 
+static void server_error(conn *c, const char *s)
+{
+	int i;
+
+	if (c == NULL) return;
+
+	server_free(c->srv);
+	c->srv = NULL;
+
+	if (c->keys) {
+		for (i = 0; i < c->keycount; i ++)
+			free(c->keys[i]);
+		free(c->keys);
+		c->keys = NULL;
+	}
+
+	c->pos = c->keycount = c->keyidx = 0;
+	list_free(c->request, 1);
+	list_free(c->response, 1);
+	out_string(c, s);
+}
+
 static void conn_close(conn *c)
 {
 	int i;
 
-	assert(c != NULL);
+	if (c == NULL) return;
 	
 	/* check client connection */
 	if (c->cfd > 0) {
 		if (verbose_mode)
-			fprintf(stderr, "close client connection fd %d\n", c->cfd);
+			fprintf(stderr, "CLOSE CLIENT CONNECTION FD %d\n", c->cfd);
 		event_del(&(c->ev));
 		close(c->cfd);
 		curconns --;
@@ -677,6 +712,8 @@ static void do_transcation(conn *c)
 
 	/* recycle previous server connection */
 	put_server_into_pool(c);
+
+	c->flag.is_backup = 0;
 	
 	if (c->flag.is_get_cmd) {
 		while(c->keyidx < c->keycount) {
@@ -720,13 +757,13 @@ static void do_transcation(conn *c)
 	s->owner = m;
 
 	if (verbose_mode) 
-		fprintf(stderr, "%s -> %s:%d\n", key, m->ip, m->port);
+		fprintf(stderr, "%c KEY \"%s\" -> %s:%d\n", c->flag.is_get_cmd?'R':'W', key, m->ip, m->port);
 
 	if (c->srv->sfd <= 0) {
 		c->srv->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (c->srv->sfd < 0) {
 			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
-			conn_close(c);
+			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
 		fcntl(c->srv->sfd, F_SETFL, fcntl(c->srv->sfd, F_GETFL)|O_NONBLOCK);
@@ -741,8 +778,7 @@ static void do_transcation(conn *c)
 		b = buffer_init_size(strlen(key) + 20);
 		if (b == NULL) {
 			fprintf(stderr, "SERVER OUT OF MEMORY\n");
-			s->state = SERVER_ERROR;
-			conn_close(c);
+			server_error(c, "SERVER_ERROR OUT OF MEMORY");
 			return;
 		}
 		b->size = snprintf(b->ptr, b->len - 1, "%s %s\r\n", c->flag.is_gets_cmd?"gets":"get", key);
@@ -761,6 +797,185 @@ static void do_transcation(conn *c)
 		event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_server, (void *)c);
 
 	event_add(&(s->ev), 0);
+}
+
+static void start_backup_transcation(conn *c)
+{
+	int size = 0, idx;
+	buffer *b, *r;
+	matrix *m;
+	server *s;
+
+	if (c == NULL || c->keycount != 1) return;
+
+	b = c->request->first;
+	while(b) {
+		size += b->size;
+		b = b->next;
+	}
+
+	if (size == 0) return;
+
+	r = buffer_init_size(size+1);
+	if (r == NULL) return;
+
+	b = c->request->first;
+	while(b) {
+		if (b->size > 0 ) {
+			memcpy(r->ptr + r->size, b->ptr, b->size);
+			r->size += b->size;
+		}
+		b = b->next;
+	}
+
+	if (c->flag.no_reply) {
+		/* " noreply\r\n" */
+		r->size -= 10;
+		r->ptr[r->size++] = '\r';
+		r->ptr[r->size++] = '\n';
+	}
+
+	if (use_ketama && backupkt) {
+		idx = get_server(backupkt, c->keys[0]);
+		if (idx < 0) {
+			/* fall back to round selection */
+			idx = hashme(c->keys[0])%backupcnt;
+		}
+	} else {
+		/* just round selection */
+		idx = hashme(c->keys[0])%backupcnt;
+	}
+
+	m = backups + idx;
+
+	if (m->pool && (m->used > 0)) {
+		s = m->pool[--m->used];
+	} else {
+		s = (struct server *) calloc(sizeof(struct server), 1);
+		if (s == NULL) {
+			buffer_free(r);
+			return;
+		}
+		s->request = list_init();
+		s->response = list_init();
+	}
+	s->owner = m;
+
+	if (verbose_mode)
+		fprintf(stderr, "B KEY \"%s\" -> %s:%d\n", c->keys[0], m->ip, m->port);
+
+	if (s->sfd <= 0) {
+		s->sfd = socket(AF_INET, SOCK_STREAM, 0); 
+		if (s->sfd < 0) {
+			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
+			free(s);
+			buffer_free(r);
+			return;
+		}
+		fcntl(s->sfd, F_SETFL, fcntl(s->sfd, F_GETFL)|O_NONBLOCK);
+	}
+
+	append_buffer_to_list(s->request, r);
+
+	/* server event handler */
+	memset(&(s->ev), 0, sizeof(struct event));
+
+	event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_backup_server, (void *)s);
+
+	event_add(&(s->ev), 0);
+}
+
+static void start_transcation(conn *c)
+{
+	if (c == NULL) return;
+
+	if (c->flag.is_update_cmd && backupcnt > 0)
+		start_backup_transcation(c);
+
+	do_transcation(c);
+}
+
+static void try_backup_server(conn *c)
+{
+	int idx;
+	struct matrix *m;
+	char *key;
+	buffer *b;
+
+	if (c == NULL) return;
+
+	server_free(c->srv);
+	c->srv = NULL;
+
+	assert(c->flag.is_get_cmd);
+
+	if (c->flag.is_backup || backups == NULL) {
+		/* already tried backup server or no backup server*/
+		do_transcation(c);
+		return;
+	}
+
+	c->flag.is_backup = 1;
+	key = c->keys[c->keyidx - 1];
+	if (use_ketama && backupkt) {
+		idx = get_server(backupkt, key);
+		if (idx < 0) {
+			/* fall back to round selection */
+			idx = hashme(key)%backupcnt;
+		}
+	} else {
+		/* just round selection */
+		idx = hashme(key)%backupcnt;
+	}
+
+	m = backups + idx;
+
+	if (verbose_mode)
+		fprintf(stderr, "TRYING BACKUP SERVER %s:%d\n", m->ip, m->port);
+
+	if (m->pool && (m->used > 0)) {
+		c->srv = m->pool[--m->used];
+	} else {
+		c->srv = (struct server *) calloc(sizeof(struct server), 1);
+		assert(c->srv);
+		c->srv->request = list_init();
+		c->srv->response = list_init();
+	}
+	c->srv->owner = m;
+
+	if (verbose_mode) 
+		fprintf(stderr, "R KEY \"%s\" -> %s:%d\n", key, m->ip, m->port);
+
+	if (c->srv->sfd <= 0) {
+		c->srv->sfd = socket(AF_INET, SOCK_STREAM, 0); 
+		if (c->srv->sfd < 0) {
+			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
+			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
+			return;
+		}
+		fcntl(c->srv->sfd, F_SETFL, fcntl(c->srv->sfd, F_GETFL)|O_NONBLOCK);
+	}
+
+	/* reset flags */
+	c->srv->has_response_header = 0;
+	c->srv->remove_trail = 0;
+	c->srv->valuebytes = 0;
+
+	b = buffer_init_size(strlen(key) + 20);
+	if (b == NULL) {
+		fprintf(stderr, "SERVER OUT OF MEMORY\n");
+		server_error(c, "SERVER_ERROR OUT OF MEMORY");
+		return;
+	}
+	b->size = snprintf(b->ptr, b->len - 1, "%s %s\r\n", c->flag.is_gets_cmd?"gets":"get", key);
+	append_buffer_to_list(c->srv->request, b);
+
+	c->state = CLIENT_TRANSCATION;
+	/* server event handler */
+	memset(&(c->srv->ev), 0, sizeof(struct event));
+
+	event_set(&(c->srv->ev), c->srv->sfd, EV_PERSIST|EV_WRITE, drive_get_server, (void *)c);
+	event_add(&(c->srv->ev), 0);
 }
 
 /* drive machine for 'get/gets' commands */
@@ -787,10 +1002,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				servlen = sizeof(s->owner->dstaddr);
 				if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
 					if (errno != EINPROGRESS && errno != EALREADY) {
-						if (verbose_mode)
-							fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-								s->sfd, s->owner->ip, s->owner->port, strerror(errno));
-						conn_close(c);
+						try_backup_server(c); /* conn_close(c); */
 						return;
 					}
 				}
@@ -801,24 +1013,17 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				socket_error_len = sizeof(socket_error);
 				/* try to finish the connect() */
 				if (0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) {
-					if (verbose_mode)
-						fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-							s->sfd, s->owner->ip, s->owner->port, strerror(errno));
-					conn_close(c);
+					try_backup_server(c); /* conn_close(c); */
 					return;
 				}
 				
 				if (socket_error != 0) {
-					if (verbose_mode)
-						fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-								s->sfd, s->owner->ip, s->owner->port, strerror(socket_error));
-					conn_close(c);
+					try_backup_server(c); /* conn_close(c); */
 					return;
 				}
 				
 				if (verbose_mode)
-					fprintf(stderr, "fd %d <-> %s:%d\n", 
-							s->sfd, s->owner->ip, s->owner->port);
+					fprintf(stderr, "CONNECTED FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
 				s->state = SERVER_CONNECTED;
 				break;
 
@@ -827,8 +1032,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				r = writev_list(s->sfd, s->request);
 				if (r < 0) {
 					/* write failed */
-					s->state = SERVER_ERROR;
-					conn_close(c);
+					server_error(c, "SERVER_ERROR BACKEND SERVER ERROR");
 					return;
 				} else {
 					if (s->request->first == NULL) {
@@ -841,7 +1045,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				break;
 
 			case SERVER_ERROR:
-				conn_close(c);
+				server_error(c, "SERVER_ERROR BACKEND SERVER ERROR");
 				break;
 		}
 		return;
@@ -851,18 +1055,15 @@ static void drive_get_server(const int fd, const short which, void *arg)
    
 	/* get the byte counts of read */
 	if (ioctl(s->sfd, FIONREAD, &toread)) {
-		if (verbose_mode)
-			fprintf(stderr, "!!%d: IOCTL 'FIONREAD' ACTION FAILED, %s\n", 
-				s->sfd, strerror(errno));
 		s->state = SERVER_ERROR;
-		conn_close(c);
+		try_backup_server(c); /* conn_close(c); */
 		return;
 	}
 
 	if (toread == 0) {
 		/* memcached server close/reset connection */
 		s->state = SERVER_ERROR;
-		conn_close(c);
+		try_backup_server(c); /* conn_close(c); */
 		return;
 	}
 
@@ -881,11 +1082,8 @@ static void drive_get_server(const int fd, const short which, void *arg)
 	r = read(s->sfd, s->line + s->pos , toread);
 	if (r <= 0) {
 		if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
-			if (verbose_mode)
-				fprintf(stderr, "FAIL TO READ FROM SERVER %s:%d, %s\n", 
-					s->owner->ip, s->owner->port, strerror(errno));
 			s->state = SERVER_ERROR;
-			conn_close(c);
+			try_backup_server(c); /* conn_close(c); */
 		}
 		return;
 	}
@@ -916,7 +1114,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 					s->valuebytes = atol(p+1);
 					if (s->valuebytes < 0) {
 						s->state = SERVER_ERROR;
-						conn_close(c);
+						try_backup_server(c); /* conn_close(c); */
 					}
 				}
 			}
@@ -935,7 +1133,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 		if (b == NULL) {
 			fprintf(stderr, "SERVER OUT OF MEMORY\n");
 			s->state = SERVER_ERROR;
-			conn_close(c);
+			try_backup_server(c); /* conn_close(c); */
 			return;
 		}
 		memcpy(b->ptr, s->line, pos);
@@ -963,7 +1161,7 @@ static void drive_get_server(const int fd, const short which, void *arg)
 		if (b == NULL) {
 			fprintf(stderr, "SERVER OUT OF MEMORY\n");
 			s->state = SERVER_ERROR;
-			conn_close(c);
+			try_backup_server(c); /* conn_close(c); */
 			return;
 		}
 		memcpy(b->ptr, s->line, s->pos);
@@ -1019,10 +1217,7 @@ static void drive_server(const int fd, const short which, void *arg)
 				servlen = sizeof(s->owner->dstaddr);
 				if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
 					if (errno != EINPROGRESS && errno != EALREADY) {
-						if (verbose_mode)
-							fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-								s->sfd, s->owner->ip, s->owner->port, strerror(errno));
-						conn_close(c);
+						server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 						return;
 					}
 				}
@@ -1033,24 +1228,18 @@ static void drive_server(const int fd, const short which, void *arg)
 				socket_error_len = sizeof(socket_error);
 				/* try to finish the connect() */
 				if (0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) {
-					if (verbose_mode)
-						fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-							s->sfd, s->owner->ip, s->owner->port, strerror(errno));
-					conn_close(c);
+					server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 					return;
 				}
 				
 				if (socket_error != 0) {
-					if (verbose_mode)
-						fprintf(stderr, "!!%d: CAN'T CONNECT TO %s:%d, %s\n",
-								s->sfd, s->owner->ip, s->owner->port, strerror(socket_error));
-					conn_close(c);
+					server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 					return;
 				}
 				
 				if (verbose_mode)
-					fprintf(stderr, "fd %d <-> %s:%d\n", 
-							s->sfd, s->owner->ip, s->owner->port);
+					fprintf(stderr, "CONNECTED FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
+
 				s->state = SERVER_CONNECTED;
 				break;
 
@@ -1059,8 +1248,7 @@ static void drive_server(const int fd, const short which, void *arg)
 				r = writev_list(s->sfd, s->request);
 				if (r < 0) {
 					/* write failed */
-					s->state = SERVER_ERROR;
-					conn_close(c);
+					server_error(c, "SERVER_ERROR CAN NOT WRITE REQUEST TO BACKEND SERVER");
 					return;
 				} else {
 					if (s->request->first == NULL ) {
@@ -1077,7 +1265,7 @@ static void drive_server(const int fd, const short which, void *arg)
 				break;
 
 			case SERVER_ERROR:
-				conn_close(c);
+				server_error(c, "SERVER_ERROR BACKEND SERVER ERROR");
 				break;
 		}
 		return;
@@ -1087,17 +1275,14 @@ static void drive_server(const int fd, const short which, void *arg)
    
 	/* get the byte counts of read */
 	if (ioctl(s->sfd, FIONREAD, &toread)) {
-		if (verbose_mode)
-			fprintf(stderr, "!!%d: IOCTL 'FIONREAD' ACTION FAILED, %s\n", 
-				s->sfd, strerror(errno));
-		conn_close(c);
+		server_error(c, "SERVER_ERROR BACKEND SERVER RESET CONNECTION");
 		return;
 	}
 
 	if (toread == 0) {
 		/* memcached server close/reset connection */
 		s->state = SERVER_ERROR;
-		conn_close(c);
+		server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
 		return;
 	}
 
@@ -1106,13 +1291,9 @@ static void drive_server(const int fd, const short which, void *arg)
 
 	r = read(s->sfd, s->line + s->pos , toread);
 	if (r <= 0) {
-		if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
-			if (verbose_mode)
-				fprintf(stderr, "FAIL TO READ FROM SERVER %s:%d, %s\n", 
-					s->owner->ip, s->owner->port, strerror(errno));
-			s->state = SERVER_ERROR;
-			conn_close(c);
-		}
+		if (r == 0 || (errno != EAGAIN && errno != EINTR))
+			server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
+
 		return;
 	}
 
@@ -1129,8 +1310,7 @@ static void drive_server(const int fd, const short which, void *arg)
 	b = buffer_init_size(pos + 1);
 	if (b == NULL) {
 		fprintf(stderr, "SERVER OUT OF MEMORY\n");
-		s->state = SERVER_ERROR;
-		conn_close(c);
+		server_error(c, "SERVER_ERROR OUT OF MEMORY");
 		return;
 	}
 	memcpy(b->ptr, s->line, pos);
@@ -1149,6 +1329,149 @@ static void drive_server(const int fd, const short which, void *arg)
 		/* client reset/close connection*/
 		conn_close(c);
 	}
+}
+
+static void drive_backup_server(const int fd, const short which, void *arg)
+{
+	struct server *s, **p;
+	int socket_error, r, toread, pos;
+	socklen_t servlen, socket_error_len;
+	struct matrix *m;
+
+	if (arg == NULL) return;
+	s = (struct server *)arg;
+
+	if (which & EV_WRITE) {
+		switch (s->state) {
+			case SERVER_INIT:
+				servlen = sizeof(s->owner->dstaddr);
+				if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
+					if (errno != EINPROGRESS && errno != EALREADY) {
+						server_free(s);
+						return;
+					}
+				}
+				s->state = SERVER_CONNECTING;
+				break;
+
+			case SERVER_CONNECTING:
+				socket_error_len = sizeof(socket_error);
+				/* try to finish the connect() */
+				if (0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) {
+					server_free(s);
+					return;
+				}
+				
+				if (socket_error != 0) {
+					server_free(s);
+					return;
+				}
+				
+				if (verbose_mode)
+					fprintf(stderr, "CONNECTED BACKUP FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
+
+				s->state = SERVER_CONNECTED;
+				break;
+
+			case SERVER_CONNECTED:
+				/* write request to memcached server */
+				r = writev_list(s->sfd, s->request);
+				if (r < 0) {
+					/* write failed */
+					server_free(s);
+					return;
+				} else {
+					if (s->request->first == NULL ) {
+						event_del(&(s->ev));
+						event_set(&(s->ev), s->sfd, EV_PERSIST|EV_READ, drive_backup_server, arg);
+						event_add(&(s->ev), 0);
+					}
+				}
+				break;
+
+			case SERVER_ERROR:
+				server_free(s);
+				break;
+		}
+		return;
+	} 
+	
+	if (!(which & EV_READ)) return;
+   
+	/* get the byte counts of read */
+	if (ioctl(s->sfd, FIONREAD, &toread)) {
+		server_free(s);
+		return;
+	}
+
+	if (toread == 0) {
+		/* memcached server close/reset connection */
+		server_free(s);
+		return;
+	}
+
+	if (toread > (BUFFERLEN - s->pos))
+		toread = BUFFERLEN - s->pos;
+
+	r = read(s->sfd, s->line + s->pos , toread);
+	if (r <= 0) {
+		if (r == 0 || (errno != EAGAIN && errno != EINTR))
+			server_free(s);
+
+		return;
+	}
+
+	s->pos += r;
+	s->line[s->pos] = '\0';
+
+	pos = memstr(s->line, "\n", s->pos, 1);
+
+	if (pos == -1) return; /* not found */
+
+	/* put backup connection into pool */
+	list_free(s->request, 1);
+	list_free(s->response, 1);
+
+	s->pos = s->has_response_header = s->remove_trail = 0;
+
+#define STEP 5
+#define MAXIDLE 10
+
+	m = s->owner;
+	if (m->size == 0) {
+		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
+		if (m->pool == NULL) {
+			fprintf(stderr, "out of memory for pool allocation\n");
+			m = NULL;
+		} else {
+			m->used = 0;
+			m->size = STEP;
+		}
+	} else if (m->used == m->size) {
+		if (m->size < MAXIDLE) {
+			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
+			if (p == NULL) {
+				fprintf(stderr, "out of memory for pool reallocation\n");
+				m = NULL;
+			} else {
+				m->pool = p;
+				m->size += STEP;
+			}
+		} else {
+			m = NULL;
+		}
+	}
+
+	if (m != NULL) {
+		m->pool[m->used ++] = s;
+		event_del(&(s->ev));
+		memset(&(s->ev), 0, sizeof(struct event));
+	} else {
+		server_free(s);
+	}
+
+#undef STEP
+#undef MAXIDLE
 }
 
 /* return 1 if command found
@@ -1182,7 +1505,12 @@ static void process_command(conn *c)
 	b->ptr[len+2] = '\0';
 	b->size = len + 2;
 
+	
+	if (verbose_mode)
+		fprintf(stderr, "PROCESSING COMMAND: %s", b->ptr);
+
 	memset(&(c->flag), 0, sizeof(c->flag));
+	c->flag.is_update_cmd = 1;
 	c->storebytes = c->keyidx = 0;
 
 	ntokens = tokenize_command(c->line, tokens, MAX_TOKENS);
@@ -1233,6 +1561,7 @@ static void process_command(conn *c)
 
 			c->flag.is_get_cmd = 1;
 			c->keyidx = 0;
+			c->flag.is_update_cmd = 0;
 
 			if (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)
 				c->flag.is_gets_cmd = 1; /* GETS */
@@ -1358,10 +1687,10 @@ static void process_command(conn *c)
 		if (c->storebytes > 0)
 			c->state = CLIENT_NREAD;
 		else 
-			do_transcation(c);
+			start_transcation(c);
 	} else {
 		if (skip == 0)
-			do_transcation(c);
+			start_transcation(c);
 	}
 }
 
@@ -1378,9 +1707,6 @@ static void drive_client(const int fd, const short which, void *arg)
 	if (which & EV_READ) {
 		/* get the byte counts of read */
 		if (ioctl(c->cfd, FIONREAD, &toread)) {
-			if (verbose_mode)
-				fprintf(stderr, "!!%d: IOCTL 'FIONREAD' ACTION FAILED, %s\n", 
-					c->cfd, strerror(errno));
 			conn_close(c);
 			return;
 		}
@@ -1431,7 +1757,7 @@ static void drive_client(const int fd, const short which, void *arg)
 				append_buffer_to_list(c->request, b);
 				c->storebytes -= r;
 				if (c->storebytes <= 0)
-					do_transcation(c);
+					start_transcation(c);
 				break;
 		}
 	} else if (which & EV_WRITE) {
@@ -1467,7 +1793,7 @@ static void server_accept(const int fd, const short which, void *arg)
 	memset(&s_in, 0, len);
 	newfd = accept(fd, (struct sockaddr *) &s_in, &len);
 	if (newfd < 0) {
-		fprintf(stderr, "accept() failed\n");
+		fprintf(stderr, "ACCEPT() FAILED\n");
 		return ;
 	}
 
@@ -1481,19 +1807,23 @@ static void server_accept(const int fd, const short which, void *arg)
 	if (freecurr == 0) {
 		c = (struct conn *) calloc(sizeof(struct conn), 1);
 		if (c == NULL) {
-			fprintf(stderr, "out of memory for new connection\n");
+			fprintf(stderr, "OUT OF MEMORY FOR NEW CONNECTION\n");
 			close(newfd);
 			return;
 		}
 		c->request = list_init();
 		c->response = list_init();
 	} else {
+		fprintf(stderr, "HIT\n");
 		c = freeconns[--freecurr];
 	}
 
 	curconns ++;
 
 	c->cfd = newfd;
+
+	if (verbose_mode)
+		fprintf(stderr, "NEW CLIENT FD %d\n", c->cfd);
 
 	fcntl(c->cfd, F_SETFL, fcntl(c->cfd, F_GETFL)|O_NONBLOCK);
 	setsockopt(c->cfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
@@ -1507,8 +1837,30 @@ static void server_accept(const int fd, const short which, void *arg)
 	return;
 }
 
+static void free_matrix(matrix *m)
+{
+	int i;
+	struct server *s;
+
+	if (m == NULL) return;
+
+	for (i = 0; i < m->used; i ++) {
+		s = m->pool[i];
+		if (s->sfd > 0) close(s->sfd);
+		list_free(s->request, 0);
+		list_free(s->response, 0);
+		free(s);
+	}
+
+	free(m->pool);
+	free(m->ip);
+}
+
 static void server_exit(int sig)
 {
+	int i, j;
+	conn *c;
+
 	if (verbose_mode)
 		fprintf(stderr, "\nexiting\n");
 
@@ -1516,20 +1868,50 @@ static void server_exit(int sig)
 
 	if (sockfd > 0) close(sockfd);
 
+	for (i = 0; i < freecurr; i ++) {
+		c = freeconns[i];
+
+		if (c->srv) server_free(c->srv);
+		if (c->keys) {
+			for (j = 0; j < c->keycount; j ++)
+				free(c->keys[j]);
+			free(c->keys);
+			c->keys = NULL;
+		}
+
+		list_free(c->request, 0);
+		list_free(c->response, 0);
+		free(c);
+	}
 	free(freeconns);
+
 	free_ketama(ketama);
+	free_ketama(backupkt);
+
+	for (i = 0; i < matrixcnt; i ++) {
+		free_matrix(matrixs + i);
+	}
+
+	free(matrixs);
+
+	for (i = 0; i < backupcnt; i ++) {
+		free_matrix(backups + i);
+	}
+
+	free(backups);
+
 	exit(0);
 }
 
 int main(int argc, char **argv)
 {
-	char *p = NULL, *bindhost = NULL;
-	int uid, gid, todaemon = 1, flags = 1, c;
+	char *p = NULL, *bindhost = NULL, temp[65];
+	int uid, gid, todaemon = 1, flags = 1, c, i;
 	struct sockaddr_in server;
 	struct linger ling = {0, 0};
 	struct matrix *m; 
 	
-	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:k"))) {
+	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:kb:"))) {
 		switch (c) {
 		case 'u':
 			uid = atoi(optarg);
@@ -1565,6 +1947,45 @@ int main(int argc, char **argv)
 		case 'l':
 			bindhost = optarg;
 			break;
+
+		case 'b':
+			if (backupcnt == 0) {
+				backups = (struct matrix *) calloc(sizeof(struct matrix), 1);
+				if (backups == NULL) {
+					fprintf(stderr, "out of memory for %s\n", optarg);
+					exit(1);
+				}
+				m = backups;
+				backupcnt = 1;
+			} else {
+				backups = (struct matrix *)realloc(backups, sizeof(struct matrix)*(backupcnt+1));
+				if (backups == NULL) {
+					fprintf(stderr, "out of memory for %s\n", optarg);
+					exit(1);
+				}
+				m = backups + backupcnt;
+				backupcnt ++;
+			}
+			
+			p = strchr(optarg, ':');
+			if (p == NULL) {
+				m->ip = strdup(optarg);
+				m->port = 11211;
+			} else {
+				*p = '\0';
+				m->ip = strdup(optarg);
+				*p = ':';
+				p ++;
+				m->port = atoi(p);
+				if (m->port <= 0) m->port = 11211;
+			}
+
+			m->dstaddr.sin_family = AF_INET;
+			m->dstaddr.sin_addr.s_addr = inet_addr(m->ip);
+			m->dstaddr.sin_port = htons(m->port);
+			
+			break;
+
 		case 's': /* server string */
 			if (matrixcnt == 0) {
 				matrixs = (struct matrix *) calloc(sizeof(struct matrix), 1);
@@ -1600,7 +2021,6 @@ int main(int argc, char **argv)
 			m->dstaddr.sin_addr.s_addr = inet_addr(m->ip);
 			m->dstaddr.sin_port = htons(m->port);
 			
-			fprintf(stderr, "adding %s:%d to server matrix\n", m->ip, m->port);
 			break;
 		case 'h':
 		default:
@@ -1630,9 +2050,6 @@ int main(int argc, char **argv)
 			fprintf(stderr, "not enough memory to create ketama\n");
 			exit(1);
 		} else {
-			int i;
-			char temp[65];
-
 			ketama->count = matrixcnt;
 			ketama->weight = (int *)calloc(sizeof(int), ketama->count);
 			ketama->name = (char **)calloc(sizeof(char *), ketama->count);
@@ -1656,6 +2073,39 @@ int main(int argc, char **argv)
 		if (create_ketama(ketama, 500)) {
 			fprintf(stderr, "can't create ketama\n");
 			exit(1);
+		}
+
+		/* update backup server ketama */
+		if (backupcnt > 0) {
+			backupkt = (struct ketama *)calloc(sizeof(struct ketama), 1);
+			if (backupkt == NULL) {
+				fprintf(stderr, "not enough memory to create ketama\n");
+				exit(1);
+			} else {
+				backupkt->count = backupcnt;
+				backupkt->weight = (int *)calloc(sizeof(int), backupkt->count);
+				backupkt->name = (char **)calloc(sizeof(char *), backupkt->count);
+				
+				if (backupkt->weight == NULL || backupkt->name == NULL) {
+					fprintf(stderr, "not enough memory to create ketama\n");
+					exit(1);
+				}
+
+				for (i = 0; i < backupkt->count; i ++) {
+					backupkt->weight[i] = 100;
+					backupkt->totalweight += backupkt->weight[i];
+					snprintf(temp, 64, "%s-%d", backups[i].ip, backups[i].port);
+					backupkt->name[i] = strdup(temp);
+					if (backupkt->name[i] == NULL) {
+						fprintf(stderr, "not enough memory to create ketama\n");
+						exit(1);
+					}
+				}
+			}
+			if (create_ketama(backupkt, 500)) {
+				fprintf(stderr, "can't create backup ketama\n");
+				exit(1);
+			}
 		}
 
 		fprintf(stderr, "using ketama algorithm\n");
@@ -1710,6 +2160,6 @@ int main(int argc, char **argv)
 	event_set(&ev_master, sockfd, EV_READ|EV_PERSIST, server_accept, NULL);
 	event_add(&ev_master, 0);
 	event_loop(0);
-	close(sockfd);
+	server_exit(0);
 	return 0;
 }
