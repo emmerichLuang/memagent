@@ -33,6 +33,8 @@ SUCH DAMAGE.
  * 2008-09-10, ketama allocation
  * 2008-09-12, backup server added
  * 2008-09-12, try backup server for get/gets command
+ * 2008-09-16, v0.3 finished
+ * 2008-09-20, support unix domain socket
  */
 
 #define _GNU_SOURCE
@@ -47,6 +49,7 @@ SUCH DAMAGE.
 #include <netinet/in.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <sys/un.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
@@ -60,7 +63,7 @@ SUCH DAMAGE.
 
 #include "ketama.h"
 
-#define VERSION "0.2"
+#define VERSION "0.4"
 
 #define OUTOFCONN "SERVER_ERROR OUT OF CONNECTION"
 
@@ -73,6 +76,7 @@ SUCH DAMAGE.
 #define BUFFER_PIECE_SIZE 32
 
 #define UNUSED(x) ( (void)(x) )
+#define STEP 5
 
 /* structure definitions */
 typedef struct conn conn;
@@ -204,6 +208,12 @@ static struct matrix *backups= NULL; /* backup memcached server list */
 static int backupcnt = 0;
 static struct ketama *backupkt = NULL;
 
+static char *socketpath = NULL;
+static int unixfd = -1;
+static struct event ev_unix;
+
+static int maxidle = 20; /* max keep alive connections for one memcached server */
+
 static void drive_client(const int, const short, void *);
 static void drive_server(const int, const short, void *);
 static void drive_get_server(const int, const short, void *);
@@ -218,13 +228,15 @@ static void show_help(void)
 		  "Usage:\n  -h this message\n" 
 		   "  -u uid\n" 
 		   "  -g gid\n"
-		   "  -p port, default is 11211\n"
+		   "  -p port, default is 11211. (0 to disable tcp support)\n"
 		   "  -s ip:port, set memcached server ip and port\n"
 		   "  -b ip:port, set backup memcached server ip and port\n"
 		   "  -l ip, local bind ip address, default is 0.0.0.0\n"
 		   "  -n number, set max connections, default is 4096\n"
 		   "  -D don't go to background\n"
 		   "  -k use ketama key allocation algorithm\n"
+		   "  -f file, unix socket path to listen on. default is off\n"
+		   "  -i number, set max keep alive connections for one memcached server, default is 20\n"
 		   "  -v verbose\n"
 		   "\n";
 	fprintf(stderr, b, strlen(b));
@@ -428,9 +440,6 @@ static void server_free(struct server *s)
 	free(s);
 }
 
-#define STEP 5
-#define MAXIDLE 50
-
 /* put server connection into keep alive pool */
 static void put_server_into_pool(conn *c)
 {
@@ -461,7 +470,7 @@ static void put_server_into_pool(conn *c)
 			m->used = 0;
 		}
 	} else if (m->used == m->size) {
-		if (m->size < MAXIDLE) {
+		if (m->size < maxidle) {
 			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
 			if (p == NULL) {
 				fprintf(stderr, "out of memory for pool reallocation\n");
@@ -484,9 +493,6 @@ static void put_server_into_pool(conn *c)
 	}
 
 }
-
-#undef STEP
-#undef MAXIDLE
 
 static void server_error(conn *c, const char *s)
 {
@@ -1434,9 +1440,6 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 
 	s->pos = s->has_response_header = s->remove_trail = 0;
 
-#define STEP 5
-#define MAXIDLE 10
-
 	m = s->owner;
 	if (m->size == 0) {
 		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
@@ -1448,7 +1451,7 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 			m->size = STEP;
 		}
 	} else if (m->used == m->size) {
-		if (m->size < MAXIDLE) {
+		if (m->size < maxidle) {
 			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
 			if (p == NULL) {
 				fprintf(stderr, "out of memory for pool reallocation\n");
@@ -1469,9 +1472,6 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 	} else {
 		server_free(s);
 	}
-
-#undef STEP
-#undef MAXIDLE
 }
 
 /* return 1 if command found
@@ -1814,7 +1814,6 @@ static void server_accept(const int fd, const short which, void *arg)
 		c->request = list_init();
 		c->response = list_init();
 	} else {
-		fprintf(stderr, "HIT\n");
 		c = freeconns[--freecurr];
 	}
 
@@ -1867,6 +1866,7 @@ static void server_exit(int sig)
 	UNUSED(sig);
 
 	if (sockfd > 0) close(sockfd);
+	if (unixfd > 0) close(unixfd);
 
 	for (i = 0; i < freecurr; i ++) {
 		c = freeconns[i];
@@ -1903,6 +1903,62 @@ static void server_exit(int sig)
 	exit(0);
 }
 
+static void server_socket_unix(void)
+{
+    struct linger ling = {0, 0};
+    struct sockaddr_un addr;
+    struct stat tstat;
+    int flags = 1;
+    int old_umask;
+
+    if (socketpath == NULL)
+        return ;
+
+    if ((unixfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        fprintf(stderr, "CAN NOT CREATE UNIX DOMAIN SOCKET");
+		return ;
+	}
+
+    fcntl(unixfd, F_SETFL, fcntl(unixfd, F_GETFL, 0) | O_NONBLOCK);
+
+    /*
+     * Clean up a previous socket file if we left it around
+     */
+    if (lstat(socketpath, &tstat) == 0) {
+        if (S_ISSOCK(tstat.st_mode))
+            unlink(socketpath);
+    }
+
+    setsockopt(unixfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+    setsockopt(unixfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+    setsockopt(unixfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+
+    /*
+     * the memset call clears nonstandard fields in some impementations
+     * that otherwise mess things up.
+     */
+    memset(&addr, 0, sizeof(addr));
+
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, socketpath);
+    old_umask=umask( ~(0644&0777));
+    if (bind(unixfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "bind errno = %d: %s\n", errno, strerror(errno));
+        close(unixfd);
+		unixfd = -1;
+        umask(old_umask);
+        return;
+    }
+
+    umask(old_umask);
+
+    if (listen(unixfd, 512) == -1) {
+		fprintf(stderr, "listen errno = %d: %s\n", errno, strerror(errno));
+        close(unixfd);
+		unixfd = -1;
+    }
+}
+
 int main(int argc, char **argv)
 {
 	char *p = NULL, *bindhost = NULL, temp[65];
@@ -1911,7 +1967,7 @@ int main(int argc, char **argv)
 	struct linger ling = {0, 0};
 	struct matrix *m; 
 	
-	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:kb:"))) {
+	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:kb:f:i:"))) {
 		switch (c) {
 		case 'u':
 			uid = atoi(optarg);
@@ -1940,9 +1996,16 @@ int main(int argc, char **argv)
 		case 'p':
 			port = atoi(optarg);
 			break;
+		case 'i':
+			maxidle = atoi(optarg);
+			if (maxidle <= 0) maxidle = 20;
+			break;
 		case 'n':
 			maxconns = atoi(optarg);
 			if (maxconns <= 0) maxconns = 4096;
+			break;
+		case 'f':
+			socketpath = optarg;
 			break;
 		case 'l':
 			bindhost = optarg;
@@ -2035,6 +2098,16 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	if (port == 0 && socketpath == NULL) {
+		fprintf(stderr, "magent must listen on tcp or unix domain socket\n");
+		exit(1);
+	}
+
+	if (todaemon && daemon(0, 0) == -1) {
+		fprintf(stderr, "failed to be a daemon\n");
+		exit(1);
+	}
+
 	freetotal = 100;
 	freecurr = 0;
 	freeconns = (struct conn **) calloc(sizeof(struct conn *), freetotal);
@@ -2111,54 +2184,64 @@ int main(int argc, char **argv)
 		fprintf(stderr, "using ketama algorithm\n");
 	}
 
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0) {
-		fprintf(stderr, "CAN'T CREATE NETWORK SOCKET\n");
-		return 1;
+	if (port > 0) {
+		sockfd = socket(AF_INET, SOCK_STREAM, 0);
+		if (sockfd < 0) {
+			fprintf(stderr, "CAN'T CREATE NETWORK SOCKET\n");
+			return 1;
+		}
+
+		fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL)|O_NONBLOCK);
+
+		setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+		setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+		setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+
+		memset((char *) &server, 0, sizeof(server));
+		server.sin_family = AF_INET;
+		if (bindhost == NULL)
+			server.sin_addr.s_addr = htonl(INADDR_ANY);
+		else
+			server.sin_addr.s_addr = inet_addr(bindhost);
+
+		server.sin_port = htons(port);
+
+		if (bind(sockfd, (struct sockaddr *) &server, sizeof(server))) {
+			if (errno != EINTR) 
+				fprintf(stderr, "bind errno = %d: %s\n", errno, strerror(errno));
+			close(sockfd);
+			exit(1);
+		}
+
+		if (listen(sockfd, 512)) {
+			fprintf(stderr, "listen errno = %d: %s\n", errno, strerror(errno));
+			close(sockfd);
+			exit(1);
+		}
+
 	}
 
-	fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL)|O_NONBLOCK);
-
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-	setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-	setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-
-	memset((char *) &server, 0, sizeof(server));
-	server.sin_family = AF_INET;
-	if (bindhost == NULL)
-		server.sin_addr.s_addr = htonl(INADDR_ANY);
-	else
-		server.sin_addr.s_addr = inet_addr(bindhost);
-
-	server.sin_port = htons(port);
-
-	if (bind(sockfd, (struct sockaddr *) &server, sizeof(server))) {
-		if (errno != EINTR) 
-			fprintf(stderr, "bind errno = %d: %s\n", errno, strerror(errno));
-		close(sockfd);
-		exit(1);
-	}
-
-	if (listen(sockfd, 512)) {
-		fprintf(stderr, "listen errno = %d: %s\n", errno, strerror(errno));
-		close(sockfd);
-		exit(1);
-	}
-
-	if (verbose_mode)
-		fprintf(stderr, "memcached agent listen at port %d\n", port);
-
-	if (todaemon && daemon(0, 0) == -1) {
-		fprintf(stderr, "failed to be a daemon\n");
-		exit(1);
-	}
+	if (socketpath) 
+		server_socket_unix();
 
 	signal(SIGTERM, server_exit);
 	signal(SIGINT, server_exit);
 
 	event_init();
-	event_set(&ev_master, sockfd, EV_READ|EV_PERSIST, server_accept, NULL);
-	event_add(&ev_master, 0);
+
+	if (sockfd > 0) {
+		if (verbose_mode)
+			fprintf(stderr, "memcached agent listen at port %d\n", port);
+		event_set(&ev_master, sockfd, EV_READ|EV_PERSIST, server_accept, NULL);
+		event_add(&ev_master, 0);
+	}
+
+	if (unixfd > 0) {
+		if (verbose_mode)
+			fprintf(stderr, "memcached agent listen at unix domain socket \"%s\"\n", socketpath);
+		event_set(&ev_unix, unixfd, EV_READ|EV_PERSIST, server_accept, NULL);
+		event_add(&ev_unix, 0);
+	}
 	event_loop(0);
 	server_exit(0);
 	return 0;
