@@ -160,9 +160,9 @@ struct conn {
 		int is_gets_cmd:1;
 		int is_set_cmd:1;
 		int no_reply:1;
-		int is_finished:1;
 		int is_update_cmd:1;
 		int is_backup:1;
+		int is_last_key:1;
 	} flag;
 
 	int keycount; /* GET/GETS multi keys */
@@ -584,7 +584,7 @@ static int writev_list(int fd, list *l)
 	struct iovec chunks[UIO_MAXIOV];
 	buffer *b;
 
-	if (l == NULL || fd <= 0) return 0;
+	if (l == NULL || l->first == NULL || fd <= 0) return 0;
 
 	for (num_chunks = 0, b = l->first; b && num_chunks < UIO_MAXIOV; num_chunks ++, b = b->next) ;
 
@@ -692,16 +692,11 @@ static void finish_transcation(conn *c)
 			free(c->keys[i]);
 		free(c->keys);
 		c->keys = NULL;
-		c->keycount = 0;
+		c->keycount = c->keyidx = 0;
 	}
 
 	c->state = CLIENT_COMMAND;
 	list_free(c->request, 1);
-
-	if (c->flag.is_get_cmd && (c->flag.is_finished == 0)) {
-		c->flag.is_finished = 1;
-		out_string(c, "END");
-	}
 }
 
 /* start/repeat memcached proxy transcations */
@@ -722,18 +717,13 @@ static void do_transcation(conn *c)
 	c->flag.is_backup = 0;
 	
 	if (c->flag.is_get_cmd) {
-		while(c->keyidx < c->keycount) {
-			key = c->keys[c->keyidx];
-			if (key != NULL) break;
-			else c->keyidx ++;
-		}
-
-		if (key == NULL || c->keyidx == c->keycount) {
+		if (c->keyidx >= c->keycount) {
 			/* end of get transcation */
 			finish_transcation(c);
 			return;
 		}
-		c->keyidx ++;
+		key = c->keys[c->keyidx++];
+		if (c->keyidx == c->keycount) c->flag.is_last_key = 1;
 	} else {
 		key = c->keys[0];
 	}
@@ -1130,6 +1120,8 @@ static void drive_get_server(const int fd, const short which, void *arg)
 			/* END\r\n or SERVER_ERROR\r\n
 			 * just skip this transcation
 			 */
+			if (c->flag.is_last_key)
+				out_string(c, "END");
 			do_transcation(c);
 			return;
 		}
@@ -1185,6 +1177,8 @@ static void drive_get_server(const int fd, const short which, void *arg)
 	if (s->valuebytes == 0) {
 		/* GET commands finished, go on next memcached server */
 		move_list(s->response, c->response);
+		if (c->flag.is_last_key)
+			out_string(c, "END");
 		if (writev_list(c->cfd, c->response) >= 0) {
 			if (c->response->first) {
 				event_del(&(c->ev));
@@ -1505,7 +1499,6 @@ static void process_command(conn *c)
 	b->ptr[len+2] = '\0';
 	b->size = len + 2;
 
-	
 	if (verbose_mode)
 		fprintf(stderr, "PROCESSING COMMAND: %s", b->ptr);
 
@@ -1556,6 +1549,9 @@ static void process_command(conn *c)
 						c->keycount ++;
 						pp = strtok(NULL, " ");
 					}
+				} else {
+					/* last key is NULL, set keycount to actual number*/
+					c->keycount = j;
 				}
 			}
 
