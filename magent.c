@@ -35,6 +35,8 @@ SUCH DAMAGE.
  * 2008-09-12, try backup server for get/gets command
  * 2008-09-16, v0.3 finished
  * 2008-09-20, support unix domain socket
+ * 2008-09-23, write "END\r\n" with the last packet of GET/GETS response
+ * 2008-09-23, combine drive_get_server with drive_server functions -> drive_memcached_server function
  */
 
 #define _GNU_SOURCE
@@ -73,7 +75,7 @@ SUCH DAMAGE.
 #define KEY_TOKEN 1
 #define BYTES_TOKEN 4
 #define KEY_MAX_LENGTH 250
-#define BUFFER_PIECE_SIZE 32
+#define BUFFER_PIECE_SIZE 16
 
 #define UNUSED(x) ( (void)(x) )
 #define STEP 5
@@ -119,6 +121,7 @@ struct server {
 	int sfd;
 	server_state_t state;
 	struct event ev;
+	int ev_flags;
 	
 	matrix *owner;
 
@@ -148,6 +151,7 @@ struct conn {
 	int cfd;
 	client_state_t state;
 	struct event ev;
+	int ev_flags;
 
 	/* command buffer */
 	char line[BUFFERLEN+1];
@@ -215,12 +219,13 @@ static struct event ev_unix;
 static int maxidle = 20; /* max keep alive connections for one memcached server */
 
 static void drive_client(const int, const short, void *);
-static void drive_server(const int, const short, void *);
-static void drive_get_server(const int, const short, void *);
 static void drive_backup_server(const int, const short, void *);
+static void drive_memcached_server(const int, const short, void *);
 static void finish_transcation(conn *);
 static void do_transcation(conn *);
 static void out_string(conn *, const char *);
+static void process_update_response(conn *);
+static void process_get_response(conn *, int);
 
 static void show_help(void)
 {
@@ -669,10 +674,12 @@ static void out_string(conn *c, const char *str)
 	append_buffer_to_list(c->response, b);
 
 	if (writev_list(c->cfd, c->response) >= 0) {
-		if (c->response->first) {
+		if (c->response->first && (c->ev_flags != EV_WRITE)) {
+			/* update event handler */
 			event_del(&(c->ev));
 			event_set(&(c->ev), c->cfd, EV_WRITE|EV_PERSIST, drive_client, (void *) c);
 			event_add(&(c->ev), 0);
+			c->ev_flags = EV_WRITE;
 		}
 	} else {
 		/* client reset/close connection*/
@@ -787,12 +794,9 @@ static void do_transcation(conn *c)
 	/* server event handler */
 	memset(&(s->ev), 0, sizeof(struct event));
 
-	if (c->flag.is_get_cmd)
-		event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_get_server, (void *)c);
-	else
-		event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_server, (void *)c);
-
+	event_set(&(s->ev), s->sfd, EV_PERSIST|EV_WRITE, drive_memcached_server, (void *)c);
 	event_add(&(s->ev), 0);
+	s->ev_flags = EV_WRITE;
 }
 
 static void start_backup_transcation(conn *c)
@@ -970,17 +974,16 @@ static void try_backup_server(conn *c)
 	/* server event handler */
 	memset(&(c->srv->ev), 0, sizeof(struct event));
 
-	event_set(&(c->srv->ev), c->srv->sfd, EV_PERSIST|EV_WRITE, drive_get_server, (void *)c);
+	event_set(&(c->srv->ev), c->srv->sfd, EV_PERSIST|EV_WRITE, drive_memcached_server, (void *)c);
 	event_add(&(c->srv->ev), 0);
+	c->srv->ev_flags = EV_WRITE;
 }
 
-/* drive machine for 'get/gets' commands */
-static void drive_get_server(const int fd, const short which, void *arg)
+static void drive_memcached_server(const int fd, const short which, void *arg)
 {
 	struct server *s;
 	conn *c;
-	buffer *b;
-	int socket_error, r, toread, pos;
+	int socket_error, r, toread;
 	socklen_t servlen, socket_error_len;
 
 	if (arg == NULL) return;
@@ -989,16 +992,16 @@ static void drive_get_server(const int fd, const short which, void *arg)
 	s = c->srv;
 	if (s == NULL) return;
 
-	/* double check */
-	assert(c->flag.is_get_cmd);
-
 	if (which & EV_WRITE) {
 		switch (s->state) {
 			case SERVER_INIT:
 				servlen = sizeof(s->owner->dstaddr);
 				if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
 					if (errno != EINPROGRESS && errno != EALREADY) {
-						try_backup_server(c); /* conn_close(c); */
+						if (c->flag.is_get_cmd)
+							try_backup_server(c);
+						else
+							server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 						return;
 					}
 				}
@@ -1009,17 +1012,24 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				socket_error_len = sizeof(socket_error);
 				/* try to finish the connect() */
 				if (0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) {
-					try_backup_server(c); /* conn_close(c); */
+					if (c->flag.is_get_cmd)
+						try_backup_server(c);
+					else
+						server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 					return;
 				}
 				
 				if (socket_error != 0) {
-					try_backup_server(c); /* conn_close(c); */
+					if (c->flag.is_get_cmd)
+						try_backup_server(c);
+					else
+						server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
 					return;
 				}
 				
 				if (verbose_mode)
 					fprintf(stderr, "CONNECTED FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
+
 				s->state = SERVER_CONNECTED;
 				break;
 
@@ -1028,14 +1038,19 @@ static void drive_get_server(const int fd, const short which, void *arg)
 				r = writev_list(s->sfd, s->request);
 				if (r < 0) {
 					/* write failed */
-					server_error(c, "SERVER_ERROR BACKEND SERVER ERROR");
+					server_error(c, "SERVER_ERROR CAN NOT WRITE REQUEST TO BACKEND SERVER");
 					return;
 				} else {
-					if (s->request->first == NULL) {
+					if (s->request->first == NULL ) {
 						/* finish writing request to memcached server */
-						event_del(&(s->ev));
-						event_set(&(s->ev), s->sfd, EV_PERSIST|EV_READ, drive_get_server, arg);
-						event_add(&(s->ev), 0);
+						if (c->flag.no_reply) {
+							finish_transcation(c);
+						} else if (s->ev_flags != EV_READ) {
+							event_del(&(s->ev));
+							event_set(&(s->ev), s->sfd, EV_PERSIST|EV_READ, drive_memcached_server, arg);
+							event_add(&(s->ev), 0);
+							s->ev_flags = EV_READ;
+						}
 					}
 				}
 				break;
@@ -1051,35 +1066,46 @@ static void drive_get_server(const int fd, const short which, void *arg)
    
 	/* get the byte counts of read */
 	if (ioctl(s->sfd, FIONREAD, &toread)) {
-		s->state = SERVER_ERROR;
-		try_backup_server(c); /* conn_close(c); */
+		if (c->flag.is_get_cmd)
+			try_backup_server(c);
+		else
+			server_error(c, "SERVER_ERROR BACKEND SERVER RESET CONNECTION");
 		return;
 	}
 
 	if (toread == 0) {
 		/* memcached server close/reset connection */
-		s->state = SERVER_ERROR;
-		try_backup_server(c); /* conn_close(c); */
+		if (c->flag.is_get_cmd)
+			try_backup_server(c);
+		else 
+			server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
 		return;
 	}
 
-	if (s->has_response_header == 0) {
-		/* NO RESPONSE HEADER */
-		if (toread > (BUFFERLEN - s->pos))
-			toread = BUFFERLEN - s->pos;
+	if (c->flag.is_get_cmd) {
+		if (s->has_response_header == 0) {
+			/* NO RESPONSE HEADER */
+			if (toread > (BUFFERLEN - s->pos))
+				toread = BUFFERLEN - s->pos;
+		} else {
+			/* HAS RESPONSE HEADER */
+			if (toread > (BUFFERLEN - s->pos))
+				toread = BUFFERLEN - s->pos;
+			if (toread > s->valuebytes)
+				toread = s->valuebytes;
+		}
 	} else {
-		/* HAS RESPONSE HEADER */
 		if (toread > (BUFFERLEN - s->pos))
 			toread = BUFFERLEN - s->pos;
-		if (toread > s->valuebytes)
-			toread = s->valuebytes;
 	}
 
 	r = read(s->sfd, s->line + s->pos , toread);
 	if (r <= 0) {
 		if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
-			s->state = SERVER_ERROR;
-			try_backup_server(c); /* conn_close(c); */
+			if (c->flag.is_get_cmd)
+				try_backup_server(c);
+			else
+				server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
 		}
 		return;
 	}
@@ -1087,6 +1113,20 @@ static void drive_get_server(const int fd, const short which, void *arg)
 	s->pos += r;
 	s->line[s->pos] = '\0';
 
+	if (c->flag.is_get_cmd)
+		process_get_response(c, r);
+	else
+		process_update_response(c);
+}
+
+static void process_get_response(conn *c, int r)
+{
+	struct server *s;
+	buffer *b;
+	int pos;
+
+	if (c == NULL || c->srv == NULL || c->srv->pos == 0) return;
+	s = c->srv;
 	if (s->has_response_header == 0) {
 		pos = memstr(s->line, "\n", s->pos, 1);
 
@@ -1177,13 +1217,24 @@ static void drive_get_server(const int fd, const short which, void *arg)
 	if (s->valuebytes == 0) {
 		/* GET commands finished, go on next memcached server */
 		move_list(s->response, c->response);
-		if (c->flag.is_last_key)
-			out_string(c, "END");
+		if (c->flag.is_last_key) {
+			b = buffer_init_size(6);
+			if (b) {
+				memcpy(b->ptr, "END\r\n", 5);
+				b->size = 5;
+				b->ptr[b->size] = '\0'; 
+				append_buffer_to_list(c->response, b);
+			} else {
+				fprintf(stderr, "OUT OF MEMORY\n");
+			}
+		}
+
 		if (writev_list(c->cfd, c->response) >= 0) {
-			if (c->response->first) {
+			if (c->response->first && (c->ev_flags != EV_WRITE)) {
 				event_del(&(c->ev));
 				event_set(&(c->ev), c->cfd, EV_WRITE|EV_PERSIST, drive_client, (void *) c);
 				event_add(&(c->ev), 0);
+				c->ev_flags = EV_WRITE;
 			}
 			do_transcation(c); /* NEXT MEMCACHED SERVER */
 		} else {
@@ -1191,117 +1242,18 @@ static void drive_get_server(const int fd, const short which, void *arg)
 			conn_close(c);
 		}
 	}
+
 }
 
-/* drive machine for commands other than 'get/gets' */
-static void drive_server(const int fd, const short which, void *arg)
+static void process_update_response(conn *c)
 {
 	struct server *s;
-	conn *c;
 	buffer *b;
-	int socket_error, r, toread, pos;
-	socklen_t servlen, socket_error_len;
+	int pos;
 
-	if (arg == NULL) return;
-	c = (conn *)arg;
-
+	if (c == NULL || c->srv == NULL || c->srv->pos == 0) return;
 	s = c->srv;
-	if (s == NULL) return;
-
-	/* double check */
-	assert(!c->flag.is_get_cmd);
-
-	if (which & EV_WRITE) {
-		switch (s->state) {
-			case SERVER_INIT:
-				servlen = sizeof(s->owner->dstaddr);
-				if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
-					if (errno != EINPROGRESS && errno != EALREADY) {
-						server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
-						return;
-					}
-				}
-				s->state = SERVER_CONNECTING;
-				break;
-
-			case SERVER_CONNECTING:
-				socket_error_len = sizeof(socket_error);
-				/* try to finish the connect() */
-				if (0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) {
-					server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
-					return;
-				}
-				
-				if (socket_error != 0) {
-					server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND SERVER");
-					return;
-				}
-				
-				if (verbose_mode)
-					fprintf(stderr, "CONNECTED FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
-
-				s->state = SERVER_CONNECTED;
-				break;
-
-			case SERVER_CONNECTED:
-				/* write request to memcached server */
-				r = writev_list(s->sfd, s->request);
-				if (r < 0) {
-					/* write failed */
-					server_error(c, "SERVER_ERROR CAN NOT WRITE REQUEST TO BACKEND SERVER");
-					return;
-				} else {
-					if (s->request->first == NULL ) {
-						/* finish writing request to memcached server */
-						if (c->flag.no_reply) {
-							finish_transcation(c);
-						} else {
-							event_del(&(s->ev));
-							event_set(&(s->ev), s->sfd, EV_PERSIST|EV_READ, drive_server, arg);
-							event_add(&(s->ev), 0);
-						}
-					}
-				}
-				break;
-
-			case SERVER_ERROR:
-				server_error(c, "SERVER_ERROR BACKEND SERVER ERROR");
-				break;
-		}
-		return;
-	} 
-	
-	if (!(which & EV_READ)) return;
-   
-	/* get the byte counts of read */
-	if (ioctl(s->sfd, FIONREAD, &toread)) {
-		server_error(c, "SERVER_ERROR BACKEND SERVER RESET CONNECTION");
-		return;
-	}
-
-	if (toread == 0) {
-		/* memcached server close/reset connection */
-		s->state = SERVER_ERROR;
-		server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
-		return;
-	}
-
-	if (toread > (BUFFERLEN - s->pos))
-		toread = BUFFERLEN - s->pos;
-
-	r = read(s->sfd, s->line + s->pos , toread);
-	if (r <= 0) {
-		if (r == 0 || (errno != EAGAIN && errno != EINTR))
-			server_error(c, "SERVER_ERROR BACKEND SERVER CLOSE CONNECTION");
-
-		return;
-	}
-
-	s->pos += r;
-	s->line[s->pos] = '\0';
-
 	pos = memstr(s->line, "\n", s->pos, 1);
-
 	if (pos == -1) return; /* not found */
 
 	/* found \n */
@@ -1319,10 +1271,11 @@ static void drive_server(const int fd, const short which, void *arg)
 	append_buffer_to_list(s->response, b);
 	move_list(s->response, c->response);
 	if (writev_list(c->cfd, c->response) >= 0) {
-		if (c->response->first) {
+		if (c->response->first && (c->ev_flags !=  EV_WRITE)) {
 			event_del(&(c->ev));
 			event_set(&(c->ev), c->cfd, EV_WRITE|EV_PERSIST, drive_client, (void *) c);
 			event_add(&(c->ev), 0);
+			c->ev_flags = EV_WRITE;
 		}
 		finish_transcation(c);
 	} else {
@@ -1381,7 +1334,7 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 					server_free(s);
 					return;
 				} else {
-					if (s->request->first == NULL ) {
+					if (s->request->first == NULL) {
 						event_del(&(s->ev));
 						event_set(&(s->ev), s->sfd, EV_PERSIST|EV_READ, drive_backup_server, arg);
 						event_add(&(s->ev), 0);
@@ -1771,6 +1724,7 @@ static void drive_client(const int fd, const short which, void *arg)
 			event_del(&(c->ev));
 			event_set(&(c->ev), c->cfd, EV_READ|EV_PERSIST, drive_client, (void *) c);
 			event_add(&(c->ev), 0);
+			c->ev_flags = EV_READ;
 		}
 	}
 }
@@ -1828,6 +1782,7 @@ static void server_accept(const int fd, const short which, void *arg)
 	memset(&(c->ev), 0, sizeof(struct event));
 	event_set(&(c->ev), c->cfd, EV_READ|EV_PERSIST, drive_client, (void *) c);
 	event_add(&(c->ev), 0);
+	c->ev_flags = EV_READ;
 	
 	return;
 }
