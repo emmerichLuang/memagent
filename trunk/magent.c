@@ -201,9 +201,6 @@ typedef struct token_s {
 static int port = 11211, maxconns = 4096, curconns = 0, sockfd = -1, verbose_mode = 0, use_ketama = 0;
 static struct event ev_master;
 
-static int freetotal, freecurr;
-static struct conn **freeconns;
-
 static struct matrix *matrixs = NULL; /* memcached server list */
 static int matrixcnt = 0;
 static struct ketama *ketama = NULL;
@@ -446,15 +443,13 @@ static void server_free(struct server *s)
 }
 
 /* put server connection into keep alive pool */
-static void put_server_into_pool(conn *c)
+static void put_server_into_pool(struct server *s)
 {
 	struct matrix *m;
-	struct server **p, *s;
+	struct server **p;
 
-	if (c == NULL || c->srv == NULL) return;
+	if (s == NULL) return;
 
-	s = c->srv;
-	c->srv = NULL;
 	if (s->owner == NULL || s->state != SERVER_CONNECTED || s->sfd <= 0) {
 		server_free(s);
 		return;
@@ -537,7 +532,7 @@ static void conn_close(conn *c)
 		c->cfd = 0;
 	}
 
-	put_server_into_pool(c);
+	server_free(c->srv);
 
 	if (c->keys) {
 		for (i = 0; i < c->keycount; i ++)
@@ -546,17 +541,9 @@ static void conn_close(conn *c)
 		c->keys = NULL;
 	}
 
-	/* recycle client connections */
-	if (freecurr < freetotal) {
-		freeconns[freecurr++] = c;
-		list_free(c->request, 1);
-		list_free(c->response, 1);
-		c->keycount = c->keyidx = c->pos = c->storebytes = 0;
-	} else {
-		list_free(c->request, 0);
-		list_free(c->response, 0);
-		free(c);
-	}
+	list_free(c->request, 0);
+	list_free(c->response, 0);
+	free(c);
 }
 
 /* ------------- from lighttpd's network_writev.c ------------ */
@@ -717,9 +704,6 @@ static void do_transcation(conn *c)
 	buffer *b;
 
 	if (c == NULL) return;
-
-	/* recycle previous server connection */
-	put_server_into_pool(c);
 
 	c->flag.is_backup = 0;
 	
@@ -1160,8 +1144,9 @@ static void process_get_response(conn *c, int r)
 			/* END\r\n or SERVER_ERROR\r\n
 			 * just skip this transcation
 			 */
-			if (c->flag.is_last_key)
-				out_string(c, "END");
+			put_server_into_pool(s);
+			c->srv = NULL;
+			if (c->flag.is_last_key) out_string(c, "END");
 			do_transcation(c);
 			return;
 		}
@@ -1217,6 +1202,8 @@ static void process_get_response(conn *c, int r)
 	if (s->valuebytes == 0) {
 		/* GET commands finished, go on next memcached server */
 		move_list(s->response, c->response);
+		put_server_into_pool(s);
+		c->srv = NULL;
 		if (c->flag.is_last_key) {
 			b = buffer_init_size(6);
 			if (b) {
@@ -1270,6 +1257,8 @@ static void process_update_response(conn *c)
 
 	append_buffer_to_list(s->response, b);
 	move_list(s->response, c->response);
+	put_server_into_pool(s);
+	c->srv = NULL;
 	if (writev_list(c->cfd, c->response) >= 0) {
 		if (c->response->first && (c->ev_flags !=  EV_WRITE)) {
 			event_del(&(c->ev));
@@ -1286,10 +1275,9 @@ static void process_update_response(conn *c)
 
 static void drive_backup_server(const int fd, const short which, void *arg)
 {
-	struct server *s, **p;
+	struct server *s;
 	int socket_error, r, toread, pos;
 	socklen_t servlen, socket_error_len;
-	struct matrix *m;
 
 	if (arg == NULL) return;
 	s = (struct server *)arg;
@@ -1352,13 +1340,8 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 	if (!(which & EV_READ)) return;
    
 	/* get the byte counts of read */
-	if (ioctl(s->sfd, FIONREAD, &toread)) {
-		server_free(s);
-		return;
-	}
-
-	if (toread == 0) {
-		/* memcached server close/reset connection */
+	if (ioctl(s->sfd, FIONREAD, &toread) || toread == 0) {
+		/* ioctl error or memcached server close/reset connection */
 		server_free(s);
 		return;
 	}
@@ -1370,7 +1353,6 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 	if (r <= 0) {
 		if (r == 0 || (errno != EAGAIN && errno != EINTR))
 			server_free(s);
-
 		return;
 	}
 
@@ -1382,43 +1364,7 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 	if (pos == -1) return; /* not found */
 
 	/* put backup connection into pool */
-	list_free(s->request, 1);
-	list_free(s->response, 1);
-
-	s->pos = s->has_response_header = s->remove_trail = 0;
-
-	m = s->owner;
-	if (m->size == 0) {
-		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
-		if (m->pool == NULL) {
-			fprintf(stderr, "out of memory for pool allocation\n");
-			m = NULL;
-		} else {
-			m->used = 0;
-			m->size = STEP;
-		}
-	} else if (m->used == m->size) {
-		if (m->size < maxidle) {
-			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
-			if (p == NULL) {
-				fprintf(stderr, "out of memory for pool reallocation\n");
-				m = NULL;
-			} else {
-				m->pool = p;
-				m->size += STEP;
-			}
-		} else {
-			m = NULL;
-		}
-	}
-
-	if (m != NULL) {
-		m->pool[m->used ++] = s;
-		event_del(&(s->ev));
-		memset(&(s->ev), 0, sizeof(struct event));
-	} else {
-		server_free(s);
-	}
+	put_server_into_pool(s);
 }
 
 /* return 1 if command found
@@ -1655,12 +1601,7 @@ static void drive_client(const int fd, const short which, void *arg)
 
 	if (which & EV_READ) {
 		/* get the byte counts of read */
-		if (ioctl(c->cfd, FIONREAD, &toread)) {
-			conn_close(c);
-			return;
-		}
-
-		if (toread == 0) {
+		if (ioctl(c->cfd, FIONREAD, &toread) || toread == 0) {
 			conn_close(c);
 			return;
 		}
@@ -1754,22 +1695,16 @@ static void server_accept(const int fd, const short which, void *arg)
 		return;
 	}
 
-	if (freecurr == 0) {
-		c = (struct conn *) calloc(sizeof(struct conn), 1);
-		if (c == NULL) {
-			fprintf(stderr, "OUT OF MEMORY FOR NEW CONNECTION\n");
-			close(newfd);
-			return;
-		}
-		c->request = list_init();
-		c->response = list_init();
-	} else {
-		c = freeconns[--freecurr];
+	c = (struct conn *) calloc(sizeof(struct conn), 1);
+	if (c == NULL) {
+		fprintf(stderr, "OUT OF MEMORY FOR NEW CONNECTION\n");
+		close(newfd);
+		return;
 	}
-
-	curconns ++;
-
+	c->request = list_init();
+	c->response = list_init();
 	c->cfd = newfd;
+	curconns ++;
 
 	if (verbose_mode)
 		fprintf(stderr, "NEW CLIENT FD %d\n", c->cfd);
@@ -1777,6 +1712,7 @@ static void server_accept(const int fd, const short which, void *arg)
 	fcntl(c->cfd, F_SETFL, fcntl(c->cfd, F_GETFL)|O_NONBLOCK);
 	setsockopt(c->cfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
 	setsockopt(c->cfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+	setsockopt(c->cfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
 
 	/* setup client event handler */
 	memset(&(c->ev), 0, sizeof(struct event));
@@ -1808,8 +1744,7 @@ static void free_matrix(matrix *m)
 
 static void server_exit(int sig)
 {
-	int i, j;
-	conn *c;
+	int i;
 
 	if (verbose_mode)
 		fprintf(stderr, "\nexiting\n");
@@ -1818,23 +1753,6 @@ static void server_exit(int sig)
 
 	if (sockfd > 0) close(sockfd);
 	if (unixfd > 0) close(unixfd);
-
-	for (i = 0; i < freecurr; i ++) {
-		c = freeconns[i];
-
-		if (c->srv) server_free(c->srv);
-		if (c->keys) {
-			for (j = 0; j < c->keycount; j ++)
-				free(c->keys[j]);
-			free(c->keys);
-			c->keys = NULL;
-		}
-
-		list_free(c->request, 0);
-		list_free(c->response, 0);
-		free(c);
-	}
-	free(freeconns);
 
 	free_ketama(ketama);
 	free_ketama(backupkt);
@@ -2056,15 +1974,6 @@ int main(int argc, char **argv)
 
 	if (todaemon && daemon(0, 0) == -1) {
 		fprintf(stderr, "failed to be a daemon\n");
-		exit(1);
-	}
-
-	freetotal = 100;
-	freecurr = 0;
-	freeconns = (struct conn **) calloc(sizeof(struct conn *), freetotal);
-
-	if (freeconns == NULL) {
-		fprintf(stderr, "OUT OF MEMORY FOR FREE CONNECTION STRUCTURE\n");
 		exit(1);
 	}
 
