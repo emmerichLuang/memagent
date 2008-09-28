@@ -65,7 +65,7 @@ SUCH DAMAGE.
 
 #include "ketama.h"
 
-#define VERSION "0.4"
+#define VERSION "0.5"
 
 #define OUTOFCONN "SERVER_ERROR OUT OF CONNECTION"
 

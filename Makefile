@@ -1,4 +1,4 @@
-LIBS = -levent
+LIBS = -levent -lm
 CFLAGS = -Wall -O2 -g
 CC = gcc
 PROGS =	magent
