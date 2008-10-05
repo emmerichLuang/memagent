@@ -37,12 +37,19 @@ SUCH DAMAGE.
  * 2008-09-20, support unix domain socket
  * 2008-09-23, write "END\r\n" with the last packet of GET/GETS response
  * 2008-09-23, combine drive_get_server with drive_server functions -> drive_memcached_server function
+ * 2008-10-05, fix header file include under BSD systems
  */
 
 #define _GNU_SOURCE
 #include <sys/types.h>
-#include <stdio.h>
+
+#if defined(__FreeBSD__)
+#include <sys/uio.h>
+#include <limits.h>
+#else
 #include <getopt.h>
+#endif
+
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -61,6 +68,7 @@ SUCH DAMAGE.
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
+#include <stdio.h>
 #include <event.h>
 
 #include "ketama.h"
