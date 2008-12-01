@@ -66,7 +66,6 @@ SUCH DAMAGE.
 #include <time.h>
 #include <sys/ioctl.h>
 #include <errno.h>
-#include <assert.h>
 #include <signal.h>
 #include <stdio.h>
 #include <event.h>
@@ -433,7 +432,7 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
 	char *s, *e;
 	size_t ntokens = 0;
 
-	assert(command != NULL && tokens != NULL && max_tokens > 1);
+	if (command == NULL || tokens == NULL || max_tokens < 1) return 0;
 
 	for (s = e = command; ntokens < max_tokens - 1; ++e) {
 		if (*e == ' ') {
@@ -683,10 +682,8 @@ static void out_string(conn *c, const char *str)
 	int len = 0;
 	buffer *b;
 
-	assert(c != NULL);
+	if (c == NULL || str == NULL || str[0] == '\0') return;
 	
-	if (str == NULL || str[0] == '\0') return;
-
 	len = strlen(str);
 
 	b = buffer_init_size(len + 3);
@@ -780,7 +777,11 @@ static void do_transcation(conn *c)
 		c->srv = m->pool[--m->used];
 	} else {
 		c->srv = (struct server *) calloc(sizeof(struct server), 1);
-		assert(c->srv);
+		if (c->srv == NULL) {
+			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			conn_close(c);
+			return;
+		}
 		c->srv->request = list_init();
 		c->srv->response = list_init();
 	}
@@ -959,7 +960,11 @@ static void try_backup_server(conn *c)
 		c->srv = m->pool[--m->used];
 	} else {
 		c->srv = (struct server *) calloc(sizeof(struct server), 1);
-		assert(c->srv);
+		if (c->srv == NULL) {
+			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			conn_close(c);
+			return;
+		}
 		c->srv->request = list_init();
 		c->srv->response = list_init();
 	}
@@ -1620,7 +1625,7 @@ static void drive_client(const int fd, const short which, void *arg)
 	buffer *b;
 
 	c = (conn *)arg;
-	assert(c != NULL);
+	if (c == NULL) return;
 
 	if (which & EV_READ) {
 		/* get the byte counts of read */
@@ -1646,7 +1651,11 @@ static void drive_client(const int fd, const short which, void *arg)
 				break;
 			case CLIENT_NREAD:
 				/* we are going to read */
-				assert(c->flag.is_set_cmd);
+				if (c->flag.is_set_cmd == 0) {
+					fprintf(stderr, "WRONG STATE, SHOULD BE SET COMMAND\n");
+					conn_close(c);
+					return;
+				}
 
 				if (toread > c->storebytes) toread = c->storebytes;
 
