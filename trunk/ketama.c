@@ -428,9 +428,9 @@ int get_server(struct ketama *ring, const char *key)
 
 	maxp = highp = ring->numpoints;
 
-	while (1) {
+	while (h) {
 		midp = (unsigned int)((lowp+highp)/2);
-		if (midp == maxp) 
+		if (midp == maxp)
 			return ring->dot[0].srvid;
 
 		midval = ring->dot[midp].point;
@@ -441,12 +441,13 @@ int get_server(struct ketama *ring, const char *key)
 
 		if (midval < h)
 			lowp = midp + 1;
-		else 
+		else
 			highp = midp - 1;
 
 		if (lowp > highp)
 			return ring->dot[0].srvid;
 	}
+	return -1;
 }
 
 void free_ketama(struct ketama *k)
