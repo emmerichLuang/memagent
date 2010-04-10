@@ -222,6 +222,10 @@ static struct event ev_unix;
 
 static int maxidle = 20; /* max keep alive connections for one memcached server */
 
+static struct event ev_timer;
+time_t cur_ts;
+char cur_ts_str[128];
+
 static void drive_client(const int, const short, void *);
 static void drive_backup_server(const int, const short, void *);
 static void drive_memcached_server(const int, const short, void *);
@@ -501,7 +505,7 @@ static void put_server_into_pool(struct server *s)
 	if (m->size == 0) {
 		m->pool = (struct server **) calloc(sizeof(struct server *), STEP);
 		if (m->pool == NULL) {
-			fprintf(stderr, "out of memory for pool allocation\n");
+			fprintf(stderr, "%s: (%s.%d) out of memory for pool allocation\n", cur_ts_str, __FILE__, __LINE__);
 			m = NULL;
 		} else {
 			m->size = STEP;
@@ -511,7 +515,7 @@ static void put_server_into_pool(struct server *s)
 		if (m->size < maxidle) {
 			p = (struct server **)realloc(m->pool, sizeof(struct server *)*(m->size + STEP));
 			if (p == NULL) {
-				fprintf(stderr, "out of memory for pool reallocation\n");
+				fprintf(stderr, "%s: (%s.%d) out of memory for pool reallocation\n", cur_ts_str, __FILE__, __LINE__);
 				m = NULL;
 			} else {
 				m->pool = p;
@@ -563,7 +567,7 @@ static void conn_close(conn *c)
 	/* check client connection */
 	if (c->cfd > 0) {
 		if (verbose_mode)
-			fprintf(stderr, "CLOSE CLIENT CONNECTION FD %d\n", c->cfd);
+			fprintf(stderr, "%s: (%s.%d) CLOSE CLIENT CONNECTION FD %d\n", cur_ts_str, __FILE__, __LINE__, c->cfd);
 		event_del(&(c->ev));
 		close(c->cfd);
 		curconns --;
@@ -778,7 +782,7 @@ static void do_transcation(conn *c)
 	} else {
 		c->srv = (struct server *) calloc(sizeof(struct server), 1);
 		if (c->srv == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
@@ -789,12 +793,12 @@ static void do_transcation(conn *c)
 	s->owner = m;
 
 	if (verbose_mode) 
-		fprintf(stderr, "%c KEY \"%s\" -> %s:%d\n", c->flag.is_get_cmd?'R':'W', key, m->ip, m->port);
+		fprintf(stderr, "%s: (%s.%d) %s KEY \"%s\" -> %s:%d\n", cur_ts_str, __FILE__, __LINE__, c->flag.is_get_cmd?"GET":"SET", key, m->ip, m->port);
 
 	if (c->srv->sfd <= 0) {
 		c->srv->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (c->srv->sfd < 0) {
-			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
+			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
@@ -809,7 +813,7 @@ static void do_transcation(conn *c)
 	if (c->flag.is_get_cmd) {
 		b = buffer_init_size(strlen(key) + 20);
 		if (b == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR OUT OF MEMORY");
 			return;
 		}
@@ -891,12 +895,12 @@ static void start_backup_transcation(conn *c)
 	s->owner = m;
 
 	if (verbose_mode)
-		fprintf(stderr, "B KEY \"%s\" -> %s:%d\n", c->keys[0], m->ip, m->port);
+		fprintf(stderr, "%s: (%s.%d) BACKUP KEY \"%s\" -> %s:%d\n", cur_ts_str, __FILE__, __LINE__, c->keys[0], m->ip, m->port);
 
 	if (s->sfd <= 0) {
 		s->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (s->sfd < 0) {
-			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
+			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
 			free(s);
 			buffer_free(r);
 			return;
@@ -954,14 +958,14 @@ static void try_backup_server(conn *c)
 	m = backups + idx;
 
 	if (verbose_mode)
-		fprintf(stderr, "TRYING BACKUP SERVER %s:%d\n", m->ip, m->port);
+		fprintf(stderr, "%s: (%s.%d) TRYING BACKUP SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, m->ip, m->port);
 
 	if (m->pool && (m->used > 0)) {
 		c->srv = m->pool[--m->used];
 	} else {
 		c->srv = (struct server *) calloc(sizeof(struct server), 1);
 		if (c->srv == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
@@ -971,12 +975,12 @@ static void try_backup_server(conn *c)
 	c->srv->owner = m;
 
 	if (verbose_mode) 
-		fprintf(stderr, "%c KEY \"%s\" -> %s:%d\n", c->flag.is_get_cmd?'R':'W', key, m->ip, m->port);
+		fprintf(stderr, "%s: (%s.%d) %s KEY \"%s\" -> %s:%d\n", cur_ts_str, __FILE__, __LINE__, c->flag.is_get_cmd?"GET":"SET", key, m->ip, m->port);
 
 	if (c->srv->sfd <= 0) {
 		c->srv->sfd = socket(AF_INET, SOCK_STREAM, 0); 
 		if (c->srv->sfd < 0) {
-			fprintf(stderr, "CAN'T CREATE TCP SOCKET TO MEMCACHED\n");
+			fprintf(stderr, "%s: (%s.%d) CAN'T CREATE TCP SOCKET TO MEMCACHED\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
@@ -991,7 +995,7 @@ static void try_backup_server(conn *c)
 	if (c->flag.is_get_cmd) {
 		b = buffer_init_size(strlen(key) + 20);
 		if (b == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			server_error(c, "SERVER_ERROR OUT OF MEMORY");
 			return;
 		}
@@ -1052,7 +1056,7 @@ static void drive_memcached_server(const int fd, const short which, void *arg)
 				}
 				
 				if (verbose_mode)
-					fprintf(stderr, "CONNECTED FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
+					fprintf(stderr, "%s: (%s.%d) CONNECTED FD %d <-> %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->sfd, s->owner->ip, s->owner->port);
 
 				s->state = SERVER_CONNECTED;
 				break;
@@ -1184,7 +1188,7 @@ static void process_get_response(conn *c, int r)
 
 		b = buffer_init_size(pos + 1);
 		if (b == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			try_backup_server(c); /* conn_close(c); */
 			return;
 		}
@@ -1211,7 +1215,7 @@ static void process_get_response(conn *c, int r)
 	} else if (s->pos > 0) {
 		b = buffer_init_size(s->pos+1);
 		if (b == NULL) {
-			fprintf(stderr, "SERVER OUT OF MEMORY\n");
+			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			try_backup_server(c); /* conn_close(c); */
 			return;
 		}
@@ -1240,7 +1244,7 @@ static void process_get_response(conn *c, int r)
 				b->ptr[b->size] = '\0'; 
 				append_buffer_to_list(c->response, b);
 			} else {
-				fprintf(stderr, "OUT OF MEMORY\n");
+				fprintf(stderr, "%s: (%s.%d) OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			}
 		}
 
@@ -1280,7 +1284,7 @@ static void process_update_response(conn *c)
 
 	b = buffer_init_size(pos + 1);
 	if (b == NULL) {
-		fprintf(stderr, "SERVER OUT OF MEMORY\n");
+		fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 		server_error(c, "SERVER_ERROR OUT OF MEMORY");
 		return;
 	}
@@ -1337,7 +1341,7 @@ static void drive_backup_server(const int fd, const short which, void *arg)
 				}
 				
 				if (verbose_mode)
-					fprintf(stderr, "CONNECTED BACKUP FD %d <-> %s:%d\n", s->sfd, s->owner->ip, s->owner->port);
+					fprintf(stderr, "%s: (%s.%d) CONNECTED BACKUP FD %d <-> %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->sfd, s->owner->ip, s->owner->port);
 
 				s->state = SERVER_CONNECTED;
 				break;
@@ -1427,7 +1431,7 @@ static void process_command(conn *c)
 	b->size = len + 2;
 
 	if (verbose_mode)
-		fprintf(stderr, "PROCESSING COMMAND: %s", b->ptr);
+		fprintf(stderr, "%s: (%s.%d) PROCESSING COMMAND: %s", cur_ts_str, __FILE__, __LINE__, b->ptr);
 
 	memset(&(c->flag), 0, sizeof(c->flag));
 	c->flag.is_update_cmd = 1;
@@ -1574,7 +1578,7 @@ static void process_command(conn *c)
 			c->keycount = 1;
 			c->keys = (char **) calloc(sizeof(char *), 1);
 			if (c->keys == NULL) {
-				fprintf(stderr, "SERVER OUT OF MEMORY\n");
+				fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 				conn_close(c);
 				return;
 			}
@@ -1597,7 +1601,7 @@ static void process_command(conn *c)
 			/* append more buffer to list */
 			b = buffer_init_size(c->pos + 1);
 			if (b == NULL) {
-				fprintf(stderr, "SERVER OUT OF MEMORY\n");
+				fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 				conn_close(c);
 				return;
 			}
@@ -1652,7 +1656,7 @@ static void drive_client(const int fd, const short which, void *arg)
 			case CLIENT_NREAD:
 				/* we are going to read */
 				if (c->flag.is_set_cmd == 0) {
-					fprintf(stderr, "WRONG STATE, SHOULD BE SET COMMAND\n");
+					fprintf(stderr, "%s: (%s.%d) WRONG STATE, SHOULD BE SET COMMAND\n", cur_ts_str, __FILE__, __LINE__);
 					conn_close(c);
 					return;
 				}
@@ -1661,7 +1665,7 @@ static void drive_client(const int fd, const short which, void *arg)
 
 				b = buffer_init_size(toread + 1);
 				if (b == NULL) {
-					fprintf(stderr, "SERVER OUT OF MEMORY\n");
+					fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 					conn_close(c);
 					return;
 				}
@@ -1716,7 +1720,7 @@ static void server_accept(const int fd, const short which, void *arg)
 	memset(&s_in, 0, len);
 	newfd = accept(fd, (struct sockaddr *) &s_in, &len);
 	if (newfd < 0) {
-		fprintf(stderr, "ACCEPT() FAILED\n");
+		fprintf(stderr, "%s: (%s.%d) ACCEPT() FAILED\n", cur_ts_str, __FILE__, __LINE__);
 		return ;
 	}
 
@@ -1729,7 +1733,7 @@ static void server_accept(const int fd, const short which, void *arg)
 
 	c = (struct conn *) calloc(sizeof(struct conn), 1);
 	if (c == NULL) {
-		fprintf(stderr, "OUT OF MEMORY FOR NEW CONNECTION\n");
+		fprintf(stderr, "%s: (%s.%d) OUT OF MEMORY FOR NEW CONNECTION\n", cur_ts_str, __FILE__, __LINE__);
 		close(newfd);
 		return;
 	}
@@ -1739,7 +1743,7 @@ static void server_accept(const int fd, const short which, void *arg)
 	curconns ++;
 
 	if (verbose_mode)
-		fprintf(stderr, "NEW CLIENT FD %d\n", c->cfd);
+		fprintf(stderr, "%s: (%s.%d) NEW CLIENT FD %d\n", cur_ts_str, __FILE__, __LINE__, c->cfd);
 
 	fcntl(c->cfd, F_SETFL, fcntl(c->cfd, F_GETFL)|O_NONBLOCK);
 	setsockopt(c->cfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
@@ -1806,58 +1810,70 @@ static void server_exit(int sig)
 
 static void server_socket_unix(void)
 {
-    struct linger ling = {0, 0};
-    struct sockaddr_un addr;
-    struct stat tstat;
-    int flags = 1;
-    int old_umask;
+	struct linger ling = {0, 0};
+	struct sockaddr_un addr;
+	struct stat tstat;
+	int flags = 1;
+	int old_umask;
 
-    if (socketpath == NULL)
-        return ;
+	if (socketpath == NULL)
+		return ;
 
-    if ((unixfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-        fprintf(stderr, "CAN NOT CREATE UNIX DOMAIN SOCKET");
+	if ((unixfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+		fprintf(stderr, "%s: (%s.%d) CAN NOT CREATE UNIX DOMAIN SOCKET", cur_ts_str, __FILE__, __LINE__);
 		return ;
 	}
 
-    fcntl(unixfd, F_SETFL, fcntl(unixfd, F_GETFL, 0) | O_NONBLOCK);
+	fcntl(unixfd, F_SETFL, fcntl(unixfd, F_GETFL, 0) | O_NONBLOCK);
 
-    /*
-     * Clean up a previous socket file if we left it around
-     */
-    if (lstat(socketpath, &tstat) == 0) {
-        if (S_ISSOCK(tstat.st_mode))
-            unlink(socketpath);
-    }
+	/*
+	 * Clean up a previous socket file if we left it around
+	 */
+	if (lstat(socketpath, &tstat) == 0) {
+		if (S_ISSOCK(tstat.st_mode))
+			unlink(socketpath);
+	}
 
-    setsockopt(unixfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-    setsockopt(unixfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-    setsockopt(unixfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+	setsockopt(unixfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+	setsockopt(unixfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+	setsockopt(unixfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
 
-    /*
-     * the memset call clears nonstandard fields in some impementations
-     * that otherwise mess things up.
-     */
-    memset(&addr, 0, sizeof(addr));
+	/*
+	 * the memset call clears nonstandard fields in some impementations
+	 * that otherwise mess things up.
+	 */
+	memset(&addr, 0, sizeof(addr));
 
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, socketpath);
-    old_umask=umask( ~(0644&0777));
-    if (bind(unixfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-		fprintf(stderr, "bind errno = %d: %s\n", errno, strerror(errno));
-        close(unixfd);
+	addr.sun_family = AF_UNIX;
+	strcpy(addr.sun_path, socketpath);
+	old_umask=umask( ~(0644&0777));
+	if (bind(unixfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+		fprintf(stderr, "%s: (%s.%d) bind errno = %d: %s\n", cur_ts_str, __FILE__, __LINE__, errno, strerror(errno));
+		close(unixfd);
 		unixfd = -1;
-        umask(old_umask);
-        return;
-    }
+		umask(old_umask);
+		return;
+	}
 
-    umask(old_umask);
+	umask(old_umask);
 
-    if (listen(unixfd, 512) == -1) {
-		fprintf(stderr, "listen errno = %d: %s\n", errno, strerror(errno));
-        close(unixfd);
+	if (listen(unixfd, 512) == -1) {
+		fprintf(stderr, "%s: (%s.%d) listen errno = %d: %s\n", cur_ts_str, __FILE__, __LINE__, errno, strerror(errno));
+		close(unixfd);
 		unixfd = -1;
-    }
+	}
+}
+
+static void
+timer_service(const int fd, short which, void *arg)
+{
+	struct timeval tv;
+	
+	cur_ts = time(NULL);
+	strftime(cur_ts_str, 127, "%Y-%m-%d %H:%M:%S", localtime(&cur_ts));
+	
+	tv.tv_sec = 1; tv.tv_usec = 0; /* check for every 1 seconds */
+	event_add(&ev_timer, &tv);
 }
 
 int main(int argc, char **argv)
@@ -1867,6 +1883,7 @@ int main(int argc, char **argv)
 	struct sockaddr_in server;
 	struct linger ling = {0, 0};
 	struct matrix *m; 
+	struct timeval tv;
 	
 	while(-1 != (c = getopt(argc, argv, "p:u:g:s:Dhvn:l:kb:f:i:"))) {
 		switch (c) {
@@ -2009,6 +2026,9 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	cur_ts = time(NULL);
+	strftime(cur_ts_str, 127, "%Y-%m-%d %H:%M:%S", localtime(&cur_ts));
+
 	if (use_ketama) {
 		ketama = (struct ketama *)calloc(sizeof(struct ketama), 1);
 		if (ketama == NULL) {
@@ -2134,6 +2154,11 @@ int main(int argc, char **argv)
 		event_set(&ev_unix, unixfd, EV_READ|EV_PERSIST, server_accept, NULL);
 		event_add(&ev_unix, 0);
 	}
+
+	evtimer_set(&ev_timer, timer_service, NULL);
+	tv.tv_sec = 1; tv.tv_usec = 0; /* check for every 1 seconds */
+	event_add(&ev_timer, &tv);
+
 	event_loop(0);
 	server_exit(0);
 	return 0;
