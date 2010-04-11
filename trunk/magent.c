@@ -484,6 +484,52 @@ static void server_free(struct server *s)
 	free(s);
 }
 
+static void drive_pool_server(const int fd, const short which, void *arg)
+{
+	struct server *s;
+	struct matrix *m;
+	char buf[128];
+	int toread = 0, toexit = 0, i;
+
+	if (arg == NULL) return;
+	s = (struct server *)arg;
+
+	if (!(which & EV_READ)) return;
+   
+	/* get the byte counts of read */
+	if (ioctl(s->sfd, FIONREAD, &toread) || toread == 0) {
+		toexit = 1;
+	} else {
+		if (toread > 128) toread = 128;
+
+		if (0 == read(s->sfd, buf, toread)) toexit = 1;
+	}
+
+	if (toexit) {
+		if (verbose_mode)
+			fprintf(stderr, "%s: (%s.%d) CLOSE POOL SERVER FD %d\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
+		event_del(&(s->ev));
+		close(s->sfd);
+
+		list_free(s->request, 0);
+		list_free(s->response, 0);
+		m = s->owner;
+		if (m) {
+			/* remove from list */
+			for (i = 0; i < m->used; i ++) {
+				if (m->pool[i] == s) {
+					/* found */
+					for (; i < m->used-1; i ++)
+						m->pool[i] = m->pool[i+1];
+					-- m->used;
+					break;
+				}
+			}
+		}
+		free(s);
+	}
+}
+
 /* put server connection into keep alive pool */
 static void put_server_into_pool(struct server *s)
 {
@@ -527,9 +573,13 @@ static void put_server_into_pool(struct server *s)
 	}
 
 	if (m != NULL) {
+		if (verbose_mode)
+			fprintf(stderr, "%s: (%s.%d) PUT SERVER FD %d -> POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
 		m->pool[m->used ++] = s;
 		event_del(&(s->ev));
-		memset(&(s->ev), 0, sizeof(struct event));
+		event_set(&(s->ev), s->sfd, EV_READ|EV_PERSIST, drive_pool_server, (void *) s);
+		s->state = SERVER_INIT;
+		event_add(&(s->ev), 0);
 	} else {
 		server_free(s);
 	}
@@ -779,6 +829,8 @@ static void do_transcation(conn *c)
 
 	if (m->pool && (m->used > 0)) {
 		c->srv = m->pool[--m->used];
+		if (verbose_mode)
+			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, c->srv->sfd);
 	} else {
 		c->srv = (struct server *) calloc(sizeof(struct server), 1);
 		if (c->srv == NULL) {
@@ -803,6 +855,8 @@ static void do_transcation(conn *c)
 			return;
 		}
 		fcntl(c->srv->sfd, F_SETFL, fcntl(c->srv->sfd, F_GETFL)|O_NONBLOCK);
+	} else {
+		event_del(&(c->srv->ev)); /* delete previous pool handler */
 	}
 
 	/* reset flags */
@@ -985,6 +1039,8 @@ static void try_backup_server(conn *c)
 			return;
 		}
 		fcntl(c->srv->sfd, F_SETFL, fcntl(c->srv->sfd, F_GETFL)|O_NONBLOCK);
+	} else {
+		event_del(&(c->srv->ev)); /* delete previous pool handle handler */
 	}
 
 	/* reset flags */
@@ -1430,8 +1486,10 @@ static void process_command(conn *c)
 	b->ptr[len+2] = '\0';
 	b->size = len + 2;
 
+#if 0
 	if (verbose_mode)
 		fprintf(stderr, "%s: (%s.%d) PROCESSING COMMAND: %s", cur_ts_str, __FILE__, __LINE__, b->ptr);
+#endif
 
 	memset(&(c->flag), 0, sizeof(c->flag));
 	c->flag.is_update_cmd = 1;
