@@ -151,6 +151,7 @@ struct server {
 	/* output buffer */
 	list *response;
 
+	int pool_idx;
 };
 
 struct conn {
@@ -515,15 +516,16 @@ static void drive_pool_server(const int fd, const short which, void *arg)
 		list_free(s->response, 0);
 		m = s->owner;
 		if (m) {
-			/* remove from list */
-			for (i = 0; i < m->used; i ++) {
-				if (m->pool[i] == s) {
-					/* found */
-					for (; i < m->used-1; i ++)
-						m->pool[i] = m->pool[i+1];
-					-- m->used;
-					break;
+			if (s->pool_idx <= 0) {
+				fprintf(stderr, "%s: (%s.%d) POOL SERVER FD %d, IDX %d <= 0\n",
+						cur_ts_str, __FILE__, __LINE__, s->sfd, s->pool_idx);
+			} else {
+				/* remove from list */
+				for (i = s->pool_idx - 1; i < m->used; i ++) {
+					m->pool[i] = m->pool[i+1];
+					m->pool[i]->pool_idx = i + 1;
 				}
+				-- m->used;
 			}
 		}
 		free(s);
@@ -576,6 +578,7 @@ static void put_server_into_pool(struct server *s)
 		if (verbose_mode)
 			fprintf(stderr, "%s: (%s.%d) PUT SERVER FD %d -> POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
 		m->pool[m->used ++] = s;
+		s->pool_idx = m->used;
 		event_del(&(s->ev));
 		event_set(&(s->ev), s->sfd, EV_READ|EV_PERSIST, drive_pool_server, (void *) s);
 		s->state = SERVER_INIT;
@@ -829,6 +832,7 @@ static void do_transcation(conn *c)
 
 	if (m->pool && (m->used > 0)) {
 		c->srv = m->pool[--m->used];
+		c->srv->pool_idx = 0;
 		if (verbose_mode)
 			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, c->srv->sfd);
 	} else {
@@ -937,6 +941,7 @@ static void start_backup_transcation(conn *c)
 
 	if (m->pool && (m->used > 0)) {
 		s = m->pool[--m->used];
+		s->pool_idx = 0;
 	} else {
 		s = (struct server *) calloc(sizeof(struct server), 1);
 		if (s == NULL) {
