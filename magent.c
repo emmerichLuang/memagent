@@ -536,9 +536,9 @@ pool_server_handler(const int fd, const short which, void *arg)
 						cur_ts_str, __FILE__, __LINE__, s->sfd, s->pool_idx);
 			} else {
 				/* remove from list */
-				for (i = s->pool_idx - 1; i < m->used; i ++) {
-					m->pool[i] = m->pool[i+1];
-					m->pool[i]->pool_idx = i + 1;
+				for (i = s->pool_idx; i < m->used; i ++) {
+					m->pool[i-1] = m->pool[i];
+					m->pool[i-1]->pool_idx = i;
 				}
 				-- m->used;
 			}
@@ -878,6 +878,8 @@ start_update_backupserver(conn *c)
 	if (m->pool && (m->used > 0)) {
 		s = m->pool[--m->used];
 		s->pool_idx = 0;
+		if (verbose_mode)
+			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
 	} else {
 		s = (struct server *) calloc(sizeof(struct server), 1);
 		if (s == NULL) {
@@ -971,23 +973,23 @@ do_transcation(conn *c)
 	m = matrixs + idx;
 
 	if (m->pool && (m->used > 0)) {
-		c->srv = m->pool[--m->used];
-		c->srv->pool_idx = 0;
+		s = m->pool[--m->used];
+		s->pool_idx = 0;
 		if (verbose_mode)
-			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, c->srv->sfd);
+			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
 	} else {
-		c->srv = (struct server *) calloc(sizeof(struct server), 1);
-		if (c->srv == NULL) {
+		s = (struct server *) calloc(sizeof(struct server), 1);
+		if (s == NULL) {
 			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
-		c->srv->request = list_init();
-		c->srv->response = list_init();
-		c->srv->state = SERVER_INIT;
+		s->request = list_init();
+		s->response = list_init();
+		s->state = SERVER_INIT;
 	}
-	s = c->srv;
 	s->owner = m;
+	c->srv = s;
 
 	if (verbose_mode) 
 		fprintf(stderr, "%s: (%s.%d) %s KEY \"%s\" -> %s:%d\n", cur_ts_str, __FILE__, __LINE__, c->flag.is_get_cmd?"GET":"SET", key, m->ip, m->port);
@@ -1085,21 +1087,24 @@ try_backup_server(conn *c)
 		fprintf(stderr, "%s: (%s.%d) TRYING BACKUP SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, m->ip, m->port);
 
 	if (m->pool && (m->used > 0)) {
-		c->srv = m->pool[--m->used];
+		s = m->pool[--m->used];
+		s->pool_idx = 0;
+		if (verbose_mode)
+			fprintf(stderr, "%s: (%s.%d) GET SERVER FD %d <- POOL\n", cur_ts_str, __FILE__, __LINE__, s->sfd);
 	} else {
-		c->srv = (struct server *) calloc(sizeof(struct server), 1);
-		if (c->srv == NULL) {
+		s = (struct server *) calloc(sizeof(struct server), 1);
+		if (s == NULL) {
 			fprintf(stderr, "%s: (%s.%d) SERVER OUT OF MEMORY\n", cur_ts_str, __FILE__, __LINE__);
 			conn_close(c);
 			return;
 		}
-		c->srv->request = list_init();
-		c->srv->response = list_init();
-		memset(&(c->srv->ev), 0, sizeof(struct event));
-		c->srv->state = SERVER_INIT;
+		s->request = list_init();
+		s->response = list_init();
+		memset(&(s->ev), 0, sizeof(struct event));
+		s->state = SERVER_INIT;
 	}
-	c->srv->owner = m;
-	s = c->srv;
+	s->owner = m;
+	c->srv = s;
 
 	if (verbose_mode) 
 		fprintf(stderr, "%s: (%s.%d) %s KEY \"%s\" -> %s:%d\n", cur_ts_str, __FILE__, __LINE__, c->flag.is_get_cmd?"GET":"SET", key, m->ip, m->port);
@@ -1169,6 +1174,9 @@ drive_memcached_server(const int fd, const short which, void *arg)
 			servlen = sizeof(s->owner->dstaddr);
 			if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
 				if (errno != EINPROGRESS && errno != EALREADY) {
+					if (verbose_mode)
+						fprintf(stderr, "%s: (%s.%d) CAN'T CONNECT TO MAIN SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->owner->ip, s->owner->port);
+
 					if (backupcnt > 0)
 						try_backup_server(c);
 					else
@@ -1184,6 +1192,9 @@ drive_memcached_server(const int fd, const short which, void *arg)
 			/* try to finish the connect() */
 			if ((0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) ||
 					(socket_error != 0)) {
+				if (verbose_mode)
+					fprintf(stderr, "%s: (%s.%d) CAN'T CONNECT TO MAIN SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->owner->ip, s->owner->port);
+
 				if (backupcnt > 0)
 					try_backup_server(c);
 				else
@@ -1463,6 +1474,9 @@ drive_backup_server(const int fd, const short which, void *arg)
 			servlen = sizeof(s->owner->dstaddr);
 			if (-1 == connect(s->sfd, (struct sockaddr *) &(s->owner->dstaddr), servlen)) {
 				if (errno != EINPROGRESS && errno != EALREADY) {
+					if (verbose_mode)
+						fprintf(stderr, "%s: (%s.%d) CAN'T CONNECT TO BACKUP SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->owner->ip, s->owner->port);
+
 					server_free(s);
 					return;
 				}
@@ -1475,6 +1489,9 @@ drive_backup_server(const int fd, const short which, void *arg)
 			/* try to finish the connect() */
 			if ((0 != getsockopt(s->sfd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len)) ||
 					(socket_error != 0)) {
+				if (verbose_mode)
+					fprintf(stderr, "%s: (%s.%d) CAN'T CONNECT TO BACKUP SERVER %s:%d\n", cur_ts_str, __FILE__, __LINE__, s->owner->ip, s->owner->port);
+
 				server_free(s);
 				return;
 			}
