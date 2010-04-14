@@ -25,4 +25,4 @@ magent: $(STPROG)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 clean:
-	rm -f *.o *~ $(PROGS) tags
+	rm -f *.o *~ $(PROGS)
