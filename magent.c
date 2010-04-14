@@ -1,6 +1,6 @@
 /* 
 
-Copyright (c) 2008 QUE Hongyu
+Copyright (c) 2008, 2010 QUE Hongyu
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -72,7 +72,7 @@ SUCH DAMAGE.
 
 #include "ketama.h"
 
-#define VERSION "0.5"
+#define VERSION "0.6"
 
 #define OUTOFCONN "SERVER_ERROR OUT OF CONNECTION"
 
