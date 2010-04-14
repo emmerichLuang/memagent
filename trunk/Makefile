@@ -4,7 +4,6 @@ CC = gcc
 PROGS =	magent
 ifeq ($(ARCH), $(X64))
 	M64 = -m64
-	LIBS = -lpthread /usr/lib64/libexpat.a /usr/lib64/libevent.a /usr/lib64/libm.a
 	LIBS = /usr/lib64/libevent.a /usr/lib64/libm.a 
 else
 	LIBS = -levent -lm -L/usr/local/lib
