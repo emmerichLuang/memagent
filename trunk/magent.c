@@ -171,6 +171,7 @@ struct conn {
 		unsigned int is_get_cmd:1;
 		unsigned int is_gets_cmd:1;
 		unsigned int is_set_cmd:1;
+		unsigned int is_incr_decr_cmd:1;
 		unsigned int no_reply:1;
 		unsigned int is_update_cmd:1;
 		unsigned int is_backup:1;
@@ -1057,7 +1058,8 @@ try_backup_server(conn *c)
 	server_free(c->srv);
 	c->srv = NULL;
 
-	if (c->flag.is_backup || backups == NULL) {
+	if (c->flag.is_backup || c->flag.is_incr_decr_cmd || backups == NULL) {
+		/* don't duplicate incr/decr cmds */
 		/* already tried backup server or no backup server*/
 		do_transcation(c);
 		return;
@@ -1663,6 +1665,7 @@ process_command(conn *c)
 		 * "NOT_FOUND\r\n" to indicate the item with this value was not found 
 		 * <value>\r\n , where <value> is the new value of the item's data,
 		 */
+		c->flag.is_incr_decr_cmd = 1;
 	} else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 		/*
 		 * delete <key> [<time>] [noreply]\r\n
