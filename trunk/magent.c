@@ -94,20 +94,23 @@ typedef struct list list;
 typedef struct buffer buffer;
 typedef struct server server;
 
-typedef enum {
+typedef enum
+{
 	CLIENT_COMMAND,
 	CLIENT_NREAD, /* MORE CLIENT DATA */
 	CLIENT_TRANSCATION
 } client_state_t;
 
-typedef enum {
+typedef enum
+{
 	SERVER_INIT,
 	SERVER_CONNECTING,
 	SERVER_CONNECTED,
 	SERVER_ERROR
 } server_state_t;
 
-struct buffer {
+struct buffer
+{
 	char *ptr;
 
 	size_t used;
@@ -118,13 +121,15 @@ struct buffer {
 };
 
 /* list to buffers */
-struct list {
+struct list
+{
 	buffer *first;
 	buffer *last;
 };
 
 /* connection to memcached server */
-struct server {
+struct server
+{
 	int sfd;
 	server_state_t state;
 	struct event ev;
@@ -154,7 +159,8 @@ struct server {
 	int pool_idx;
 };
 
-struct conn {
+struct conn
+{
 	/* client part */
 	int cfd;
 	client_state_t state;
@@ -191,7 +197,8 @@ struct conn {
 };
 
 /* memcached server structure */
-struct matrix {
+struct matrix
+{
 	char *ip;
 	int port;
 	struct sockaddr_in dstaddr;
@@ -201,7 +208,8 @@ struct matrix {
 	struct server **pool;
 };
 
-typedef struct token_s {
+typedef struct token_s
+{
 	char *value;
 	size_t length;
 } token_t;
@@ -239,6 +247,8 @@ static void process_update_response(conn *);
 static void process_get_response(conn *, int);
 static void append_buffer_to_list(list *, buffer *);
 static void try_backup_server(conn *);
+
+static const char resivion[] __attribute__((used)) = { "$Id$" };
 
 static void
 show_help(void)
