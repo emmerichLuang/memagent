@@ -43,7 +43,7 @@ SUCH DAMAGE.
 #define _GNU_SOURCE
 #include <sys/types.h>
 
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || (defined(__APPLE__) && defined(__MACH__) )
 #include <sys/uio.h>
 #include <limits.h>
 #else
