@@ -1729,6 +1729,7 @@ process_command(conn *c)
 		out_string(c, "END");
 		skip = 1;
 	} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
+		buffer_free(b);
 		conn_close(c);
 		return;
 	} else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
