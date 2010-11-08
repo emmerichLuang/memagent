@@ -309,6 +309,20 @@ buffer_init_size(int size)
 }
 
 static void
+set_nonblock(int fd)
+{
+	int flags = 1;
+	struct linger ling = {0, 0};
+
+	if (fd > 0) {
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL)|O_NONBLOCK);
+		setsockopt(fd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+	}
+}
+
+static void
 buffer_free(buffer *b)
 {
 	if (!b) return;
@@ -914,7 +928,7 @@ start_update_backupserver(conn *c)
 			buffer_free(r);
 			return;
 		}
-		fcntl(s->sfd, F_SETFL, fcntl(s->sfd, F_GETFL)|O_NONBLOCK);
+		set_nonblock(s->sfd);
 	}
 
 	append_buffer_to_list(s->request, r);
@@ -1012,7 +1026,7 @@ do_transcation(conn *c)
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
-		fcntl(s->sfd, F_SETFL, fcntl(c->srv->sfd, F_GETFL)|O_NONBLOCK);
+		set_nonblock(s->sfd);
 		memset(&(s->ev), 0, sizeof(struct event));
 	} else {
 		event_del(&(c->srv->ev)); /* delete previous pool handler */
@@ -1128,7 +1142,7 @@ try_backup_server(conn *c)
 			server_error(c, "SERVER_ERROR CAN NOT CONNECT TO BACKEND");
 			return;
 		}
-		fcntl(s->sfd, F_SETFL, fcntl(s->sfd, F_GETFL)|O_NONBLOCK);
+		set_nonblock(s->sfd);
 	} else {
 		event_del(&(s->ev)); /* delete previous pool handle handler */
 		s->state = SERVER_CONNECTED;
@@ -1884,10 +1898,9 @@ static void
 server_accept(const int fd, const short which, void *arg)
 {
 	conn *c = NULL;
-	int newfd, flags = 1;
+	int newfd;
 	struct sockaddr_in s_in;
 	socklen_t len = sizeof(s_in);
-	struct linger ling = {0, 0};
 
 	UNUSED(arg);
 	UNUSED(which);
@@ -1920,10 +1933,7 @@ server_accept(const int fd, const short which, void *arg)
 	if (verbose_mode)
 		fprintf(stderr, "%s: (%s.%d) NEW CLIENT FD %d\n", cur_ts_str, __FILE__, __LINE__, c->cfd);
 
-	fcntl(c->cfd, F_SETFL, fcntl(c->cfd, F_GETFL)|O_NONBLOCK);
-	setsockopt(c->cfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-	setsockopt(c->cfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-	setsockopt(c->cfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+	set_nonblock(c->cfd);
 
 	/* setup client event handler */
 	memset(&(c->ev), 0, sizeof(struct event));
@@ -1988,10 +1998,8 @@ server_exit(int sig)
 static void
 server_socket_unix(void)
 {
-	struct linger ling = {0, 0};
 	struct sockaddr_un addr;
 	struct stat tstat;
-	int flags = 1;
 	int old_umask;
 
 	if (socketpath == NULL)
@@ -2002,7 +2010,7 @@ server_socket_unix(void)
 		return ;
 	}
 
-	fcntl(unixfd, F_SETFL, fcntl(unixfd, F_GETFL, 0) | O_NONBLOCK);
+	set_nonblock(unixfd);
 
 	/*
 	 * Clean up a previous socket file if we left it around
@@ -2011,10 +2019,6 @@ server_socket_unix(void)
 		if (S_ISSOCK(tstat.st_mode))
 			unlink(socketpath);
 	}
-
-	setsockopt(unixfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-	setsockopt(unixfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-	setsockopt(unixfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
 
 	/*
 	 * the memset call clears nonstandard fields in some impementations
@@ -2058,9 +2062,8 @@ int
 main(int argc, char **argv)
 {
 	char *p = NULL, *bindhost = NULL, temp[65];
-	int uid, gid, todaemon = 1, flags = 1, c, i;
+	int uid, gid, todaemon = 1, c, i;
 	struct sockaddr_in server;
-	struct linger ling = {0, 0};
 	struct matrix *m; 
 	struct timeval tv;
 	
@@ -2282,11 +2285,7 @@ main(int argc, char **argv)
 			return 1;
 		}
 
-		fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL)|O_NONBLOCK);
-
-		setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-		setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-		setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+		set_nonblock(sockfd);
 
 		memset((char *) &server, 0, sizeof(server));
 		server.sin_family = AF_INET;
